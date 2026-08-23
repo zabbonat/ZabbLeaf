@@ -11,6 +11,8 @@ Your Overleaf project, cloned to your machine, edited in a real editor, and comp
 - Runs as a native desktop program on Windows, macOS, and Linux.
 - Clones and syncs Overleaf projects over Git, using a token from your Overleaf account.
 - Compiles real PDFs offline with a local TeX engine — optional, see below.
+- Explains compiler errors in plain language, and installs a missing package for you.
+- Takes pasted and dropped images, and writes the `figure` block around them.
 - Keeps a local version history, so offline changes can be restored.
 - Editing is powered by the Monaco editor.
 
@@ -54,7 +56,38 @@ With the network gone the toolbar switches to **Offline Mode** — and a local e
 
 Because this is a real rebase, edits on different lines merge on their own, even inside the same file. When Overleaf changed the same lines you did, the rebase is undone rather than guessing a winner: your commit stays intact, the working tree is left clean with no conflict markers, and nothing is pushed. There is no conflict resolution screen yet, so you settle it in `~/.zabbleaf/projects/<projectId>/` with git and sync again.
 
-A project you create with **Blank** exists only on your computer at first. Overleaf's Git interface cannot create projects, so to sync one you make an empty project on overleaf.com and let ZabbLeaf link the two — it offers to do this the first time you press **Sync Overleaf**.
+A project you create locally exists only on your computer at first. Overleaf's Git interface cannot create projects, so to sync one you make an empty project on overleaf.com and let ZabbLeaf link the two — it offers to do this the first time you press **Sync Overleaf**.
+
+---
+
+## While you write
+
+### The window is yours
+
+Every column can be resized by dragging the bar between them, and closed when it is in the way — from the four switches in the toolbar, from the strip a closed panel leaves behind, or with **Ctrl+B** for the file list and **Ctrl+J** for the side panel. Double-clicking a bar puts that column back where it started. The sizes are remembered between sessions, so a two-column PDF you widened once stays wide.
+
+### Figures without leaving the app
+
+Paste a screenshot into the editor, drop an image on the window, or press **Add** under *Figures*. The file is stored in `figures/` inside the project — renamed rather than overwritten if the name is taken — and the `\begin{figure}` block, with a caption and a label, is written at the cursor. Images are part of the repository, so they sync to Overleaf like anything else.
+
+### Errors you can act on
+
+`! Undefined control sequence.` names no command, no cause and no fix. Under the PDF, each failure is now written out: what went wrong, why, and what to do about it. When the answer is a missing package — by far the most common case — there is a button that installs it, using `mpm` on MiKTeX and `tlmgr` on TeX Live. The unedited engine output is still one click away.
+
+### The side panel
+
+| Tab | What it is for |
+| --- | --- |
+| **To do** | Every `% TODO`, `\todo{}` and `\missingfigure` in the project, together with the `\cite` and `\ref` keys that resolve to nothing — the ones that compile happily and print `[?]`. Click to jump there. |
+| **Symbols** | Search by name in English or Italian — "integral", "freccia", "approx" — and click to insert. The `$...$` is added when the cursor is not already in maths. |
+| **Word count** | Counted like `texcount`: the preamble, commands and displayed maths do not count, the text inside `\textbf` or `\caption` does. Broken down by section, and shown for the selection while you have one. |
+| **Writing** | Words added per day for the last two weeks, the current streak, and the project total. Written words only — a day spent rewriting does not read as a day spent doing nothing. |
+
+The word count is also in the bar under the editor, which opens the breakdown.
+
+### Templates
+
+**New project** starts from an academic paper, a thesis with chapters in separate files, a Beamer presentation, a letter, a CV, a problem set, or a blank document. All of them use only classes and packages a plain TeX installation already has, so the first compile works.
 
 ---
 
@@ -130,7 +163,10 @@ Other missing packages are fetched by MiKTeX the first time a document needs the
 | Path | Contents |
 | --- | --- |
 | `~/.zabbleaf/projects/<projectId>/` | The cloned project — a normal Git repository |
+| `~/.zabbleaf/projects/<projectId>/figures/` | Images you paste or drop in, inside the repository so they sync |
 | `~/.zabbleaf/build/<projectId>/` | Compiler output, deliberately outside the repository |
+
+Panel sizes, the writing statistics and the version history live in the app's own storage, not in the project, so nothing about them reaches Overleaf.
 
 ---
 

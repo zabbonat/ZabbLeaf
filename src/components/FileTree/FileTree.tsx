@@ -1,5 +1,16 @@
-import React, { useState } from 'react';
-import { FileText, Folder, Plus, FileCode, Database, FolderOpen, Trash2 } from 'lucide-react';
+import React, { useRef, useState } from 'react';
+import {
+  FileText,
+  Folder,
+  Plus,
+  FileCode,
+  Database,
+  FolderOpen,
+  Trash2,
+  ImagePlus,
+  Image as ImageIcon
+} from 'lucide-react';
+import { ProjectAsset, formatBytes } from '../../services/projectAssets';
 
 export interface FileNode {
   id: string;
@@ -19,6 +30,12 @@ interface FileTreeProps {
   onDeleteFile: (id: string) => void;
   onOpenFolder: () => void;
   currentFolderPath?: string;
+  /** Images and PDFs in the project, which are not editable text. */
+  assets?: ProjectAsset[];
+  onAddImage?: (file: File) => void;
+  onInsertAsset?: (path: string) => void;
+  onDeleteAsset?: (path: string) => void;
+  width?: number;
 }
 
 export const FileTree: React.FC<FileTreeProps> = ({
@@ -28,10 +45,16 @@ export const FileTree: React.FC<FileTreeProps> = ({
   onNewFile,
   onDeleteFile,
   onOpenFolder,
-  currentFolderPath
+  currentFolderPath,
+  assets = [],
+  onAddImage,
+  onInsertAsset,
+  onDeleteAsset,
+  width
 }) => {
   const [isAddingFile, setIsAddingFile] = useState(false);
   const [newFileName, setNewFileName] = useState('');
+  const filePicker = useRef<HTMLInputElement>(null);
 
   const getFileIcon = (fileName: string) => {
     if (fileName.endsWith('.tex')) return <FileCode size={16} color="#6fa8cc" />;
@@ -50,7 +73,7 @@ export const FileTree: React.FC<FileTreeProps> = ({
   };
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" style={width ? { width } : undefined}>
       {/* Folder Picker Header */}
       <div style={{ padding: '12px 16px', borderBottom: '1px solid #39404a', background: 'rgba(28, 32, 37, 0.9)' }}>
         <button
@@ -156,6 +179,66 @@ export const FileTree: React.FC<FileTreeProps> = ({
           </li>
         ))}
       </ul>
+
+      {/* Figures: not editable text, so they never appeared in this list at all. */}
+      {onAddImage && (
+        <>
+          <div className="sidebar-header" style={{ borderTop: '1px solid #262b32' }}>
+            <span>Figures ({assets.length})</span>
+            <button
+              onClick={() => filePicker.current?.click()}
+              className="sidebar-add"
+              title="Add an image from your computer"
+            >
+              <ImagePlus size={14} /> Add
+            </button>
+          </div>
+
+          <input
+            ref={filePicker}
+            type="file"
+            accept="image/*,.pdf,.eps"
+            style={{ display: 'none' }}
+            onChange={event => {
+              const chosen = event.target.files?.[0];
+              if (chosen) onAddImage(chosen);
+              // Cleared so choosing the same file twice still fires.
+              event.target.value = '';
+            }}
+          />
+
+          {assets.length === 0 ? (
+            <div className="sidebar-hint">
+              Paste a screenshot into the editor, drop an image on the window, or use Add.
+            </div>
+          ) : (
+            <ul className="file-list">
+              {assets.map(asset => (
+                <li key={asset.name} className="file-item asset-item">
+                  <button
+                    className="asset-insert"
+                    onClick={() => onInsertAsset?.(asset.name)}
+                    title={`Insert a figure block for ${asset.name}`}
+                  >
+                    <ImageIcon size={15} color="#d1a054" />
+                    <span className="asset-name">{asset.name}</span>
+                    <span className="asset-size">{formatBytes(asset.bytes)}</span>
+                  </button>
+                  {onDeleteAsset && (
+                    <button
+                      onClick={() => onDeleteAsset(asset.name)}
+                      style={{ background: 'none', border: 'none', color: '#7b8593', cursor: 'pointer' }}
+                      title="Delete this figure"
+                    >
+                      <Trash2 size={13} />
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
 
       <div style={{ padding: '12px 16px', borderTop: '1px solid #262b32', fontSize: '0.75rem', color: '#7b8593' }}>
         <div>ZabbLeaf Desktop IDE</div>

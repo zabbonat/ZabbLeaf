@@ -1,13 +1,16 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { appWindow } from '@tauri-apps/api/window';
 import { SyncToolbar, CompilerEngine, CompilerOption } from './components/SyncToolbar/SyncToolbar';
 import { FileTree, FileNode } from './components/FileTree/FileTree';
-import { LaTeXEditor } from './components/Editor/LaTeXEditor';
+import { LaTeXEditor, EditorInsertion } from './components/Editor/LaTeXEditor';
 import { PDFPreview } from './components/PDFViewer/PDFPreview';
 import { AuthModal } from './components/AuthModal/AuthModal';
 import { ProjectList } from './components/ProjectList/ProjectList';
+import { NewProjectModal } from './components/ProjectList/NewProjectModal';
 import { ChangesModal } from './components/ChangesModal/ChangesModal';
 import { LaTeXSetupBanner, LaTeXReadyNotice, GitMissingBanner } from './components/LaTeXSetup/LaTeXSetupBanner';
-import { VersionHistory } from './components/VersionHistory/VersionHistory';
+import { SidePanel, SidePanelTab } from './components/SidePanel/SidePanel';
+import { PaneDivider, CollapsedRail } from './components/Layout/PaneDivider';
 import { overleafAuth } from './services/overleafAuth';
 import { OverleafProject, overleafApi, isPlaceholderName } from './services/overleafApi';
 import { latexCompiler, deriveProjectName } from './services/latexCompiler';
@@ -21,7 +24,22 @@ import { overleafCompiler } from './services/overleafCompiler';
 import { localTeXCompiler, TeXEngine, DetectedEngine } from './services/localTeXCompiler';
 import { versionHistory, VersionSnapshot } from './services/versionHistory';
 import { gitSyncEngine, extractProjectId, isValidProjectId } from './services/gitSync';
+import { usePanelLayout } from './hooks/usePanelLayout';
+import { useDebouncedValue } from './hooks/useDebouncedValue';
+import { countWords, countBySection, countProjectWords } from './services/textStats';
+import { collectTodos } from './services/todoScanner';
+import { writingStats } from './services/writingStats';
+import { LatexSymbol } from './services/symbolPalette';
+import { ProjectTemplate } from './services/projectTemplates';
+import {
+  projectAssets,
+  ProjectAsset,
+  figureBlock,
+  isAssetName
+} from './services/projectAssets';
+import { PanelLeft, PanelRight } from 'lucide-react';
 import './styles/main.css';
+import './styles/panels.css';
 
 type AppView = 'home' | 'editor';
 
@@ -97,6 +115,18 @@ export const App: React.FC = () => {
     () => localStorage.getItem('zabbleaf_tex_setup_dismissed') === '1'
   );
 
+  // Panels: widths, and which of them are open.
+  const { layout, toggle, show, resizeSidebar, resizePanel, resizeSplit, reset } = usePanelLayout();
+  const [sidePanelTab, setSidePanelTab] = useState<SidePanelTab>('todo');
+  const splitRef = useRef<HTMLDivElement | null>(null);
+
+  // Figures, which the editor cannot open as text and so never listed.
+  const [assets, setAssets] = useState<ProjectAsset[]>([]);
+  const [insertion, setInsertion] = useState<EditorInsertion | null>(null);
+  const [installingPackage, setInstallingPackage] = useState<string>('');
+  const [isNewProjectOpen, setIsNewProjectOpen] = useState<boolean>(false);
+  const [writingTick, setWritingTick] = useState<number>(0);
+
   // The online handler is registered once at mount, so it must read the current
   // project through refs rather than a value captured back then.
   const currentProjectRef = useRef<OverleafProject | null>(null);
@@ -114,6 +144,28 @@ export const App: React.FC = () => {
     chosenRoot && files.some(f => f.name === chosenRoot)
       ? chosenRoot
       : defaultRootDocument(rootDocuments, activeFile?.name || '');
+
+  // The current file is counted live — the status bar should react as you
+  // type — while anything that walks every file in the project waits until
+  // typing stops, which on a thesis is the difference between smooth and not.
+  const activeContent = activeFile?.content || '';
+  const wordCount = useMemo(() => countWords(activeContent), [activeContent]);
+  const sections = useMemo(() => countBySection(activeContent), [activeContent]);
+
+  const settledFiles = useDebouncedValue(files);
+  const settled = useMemo(
+    () => settledFiles.map(f => ({ name: f.name, content: f.content || '' })),
+    [settledFiles]
+  );
+  const projectWords = useMemo(() => countProjectWords(settled), [settled]);
+  const todos = useMemo(
+    () => collectTodos(settled, citations, labels),
+    [settled, citations.length, labels.length]
+  );
+  const writingSummary = useMemo(
+    () => writingStats.summary(projectId),
+    [projectId, writingTick]
+  );
 
   // Initialize git sync engine and detect local TeX installations on startup
   useEffect(() => {
@@ -457,6 +509,162 @@ ${result.log}`);
     setRevealLine({ line, nonce: Date.now() });
   };
 
+  // -------------------------------------------------------------------------
+  // Panels, figures, symbols
+  // -------------------------------------------------------------------------
+
+  /** Ctrl+B and Ctrl+J, the two people already expect from an editor. */
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'b' && key !== 'j') return;
+      event.preventDefault();
+      toggle(key === 'b' ? 'files' : 'panel');
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [toggle]);
+
+  /** Opens the side panel on a given tab, wherever it was left. */
+  const openPanel = (tab: SidePanelTab) => {
+    setSidePanelTab(tab);
+    show('panel');
+  };
+
+  const refreshAssets = useCallback(async (id: string) => {
+    setAssets(await projectAssets.list(id));
+  }, []);
+
+  /** Types something in at the caret of the editor. */
+  const insertIntoEditor = (text: string, math = false) => {
+    setInsertion({ text, math, nonce: Date.now() });
+  };
+
+  const handleInsertSymbol = (symbol: LatexSymbol) => {
+    insertIntoEditor(symbol.command, symbol.math);
+  };
+
+  /**
+   * Stores a pasted image and hands the editor the block to write.
+   *
+   * Returning the whole figure environment rather than the path is deliberate:
+   * a figure with no caption and no label cannot be referred to, and adding
+   * them afterwards never happens.
+   */
+  const handlePasteImage = useCallback(
+    async (blob: Blob): Promise<string | null> => {
+      try {
+        const path = await projectAssets.save(projectId, blob);
+        await refreshAssets(projectId);
+        showNotification(`🖼️ Saved ${path}`);
+        return figureBlock(path);
+      } catch (err: any) {
+        showNotification(`❌ ${String(err?.message || err)}`);
+        return null;
+      }
+    },
+    [projectId, refreshAssets]
+  );
+
+  /** The Add button in the file tree, for people who never paste. */
+  const handleAddImageFile = async (file: File) => {
+    if (!isAssetName(file.name)) {
+      showNotification('⚠️ That is not an image. PNG, JPG, PDF and EPS work.');
+      return;
+    }
+    try {
+      const path = await projectAssets.save(projectId, file, `figures/${file.name}`);
+      await refreshAssets(projectId);
+      insertIntoEditor(figureBlock(path));
+      showNotification(`🖼️ Added ${path}`);
+    } catch (err: any) {
+      showNotification(`❌ ${String(err?.message || err)}`);
+    }
+  };
+
+  const handleDeleteAsset = async (path: string) => {
+    if (!window.confirm(`Delete "${path}"?\n\nIt goes from your computer, and from Overleaf on the next sync.`)) {
+      return;
+    }
+    await gitSyncEngine.deleteFile(projectId, path).catch(console.error);
+    await refreshAssets(projectId);
+    showNotification(`🗑️ Deleted ${path}`);
+  };
+
+  /**
+   * Images dropped onto the window.
+   *
+   * The webview hands us paths rather than files — Tauri intercepts the drop
+   * before the DOM sees it — so the copying happens on the Rust side.
+   */
+  useEffect(() => {
+    if (currentView !== 'editor') return;
+    let dispose: (() => void) | undefined;
+
+    appWindow
+      .onFileDropEvent(async event => {
+        if (event.payload.type !== 'drop') return;
+        const images = event.payload.paths.filter(isAssetName);
+        if (images.length === 0) {
+          showNotification('⚠️ Only images can be dropped in: PNG, JPG, PDF, EPS.');
+          return;
+        }
+
+        const added: string[] = [];
+        for (const source of images) {
+          try {
+            added.push(await projectAssets.importFromPath(projectId, source));
+          } catch (err: any) {
+            showNotification(`❌ ${String(err?.message || err)}`);
+          }
+        }
+        if (added.length === 0) return;
+
+        await refreshAssets(projectId);
+        insertIntoEditor(added.map(figureBlock).join('\n'));
+        showNotification(`🖼️ Added ${added.join(', ')}`);
+      })
+      .then(unlisten => {
+        dispose = unlisten;
+      })
+      .catch(console.error);
+
+    return () => dispose?.();
+  }, [currentView, projectId, refreshAssets]);
+
+  /** Installs the package a compiler error asked for, then recompiles. */
+  const handleInstallPackage = async (packageName: string) => {
+    setInstallingPackage(packageName);
+    setNotification(`📦 Installing ${packageName}...`);
+    const result = await localTeXCompiler.installPackage(packageName);
+    setInstallingPackage('');
+    showNotification(result.success ? `✅ ${result.message}` : `❌ ${result.message}`);
+    if (result.success) handleCompile();
+  };
+
+  /**
+   * Records the word total for the streak and the daily chart.
+   *
+   * Two things this must not do: write to localStorage on every keystroke, and
+   * record the moment a project opens with no files in it yet — that would set
+   * the day's baseline to zero, and the whole document would then count as
+   * written this morning.
+   */
+  const lastRecorded = useRef<{ id: string; at: number }>({ id: '', at: 0 });
+  useEffect(() => {
+    if (currentView !== 'editor' || !projectId || files.length === 0) return;
+
+    const now = Date.now();
+    const previous = lastRecorded.current;
+    // A different project always records at once: its baseline is what matters.
+    if (previous.id === projectId && now - previous.at < 10000) return;
+
+    lastRecorded.current = { id: projectId, at: now };
+    writingStats.record(projectId, projectWords);
+    setWritingTick(tick => tick + 1);
+  }, [projectWords, projectId, currentView, files.length]);
+
   const handleSync = async () => {
     if (!currentProject) return;
 
@@ -625,12 +833,13 @@ ${result.log}`);
     } catch { /* cancelled */ }
   };
 
-  const handleOpenProject = async (project: OverleafProject) => {
+  const handleOpenProject = async (project: OverleafProject, template?: ProjectTemplate) => {
     console.log(`[OPEN-PROJECT] id="${project.id}" name="${project.name}" local=${project.isLocal}`);
     setCurrentProject(project);
     setCurrentView('editor');
     setFiles([]);
     setActiveFileId('');
+    setAssets([]);
     overleafApi.addProject(project);
 
     setChosenRoot(localStorage.getItem(`zabbleaf_root_${project.id}`) || '');
@@ -661,6 +870,9 @@ ${result.log}`);
 
     const loaded = await gitSyncEngine.readProjectFiles(project.id);
     console.log(`[OPEN-PROJECT] Loaded ${loaded.length} files: ${loaded.map(f => f.name).join(', ')}`);
+
+    // Figures are not text, so they never come back with the files above.
+    refreshAssets(project.id).catch(console.error);
 
     if (loaded.length > 0) {
       setFiles(loaded.map(f => ({
@@ -697,13 +909,30 @@ ${result.log}`);
 
     // Nothing readable on disk: a brand-new local project, or an Overleaf
     // project whose repository holds no text files.
-    setFiles([{ id: 'main.tex', name: 'main.tex', type: 'file', content: DEFAULT_LATEX }]);
-    setActiveFileId('main.tex');
-    await gitSyncEngine.writeFile(project.id, 'main.tex', DEFAULT_LATEX);
+    const starter = template
+      ? template.files
+      : [{ name: 'main.tex', content: DEFAULT_LATEX }];
+
+    setFiles(
+      starter.map(file => ({
+        id: file.name,
+        name: file.name,
+        type: 'file' as const,
+        content: file.content
+      }))
+    );
+    setActiveFileId(starter[0].name);
+
+    for (const file of starter) {
+      await gitSyncEngine.writeFile(project.id, file.name, file.content);
+    }
+
     showNotification(
-      project.isLocal
-        ? `📄 Created "${project.name}" with a starter main.tex.`
-        : '⚠️ This Overleaf project has no text files — starting from a blank main.tex.'
+      template
+        ? `📄 Created "${project.name}" from the ${template.name.toLowerCase()} template.`
+        : project.isLocal
+          ? `📄 Created "${project.name}" with a starter main.tex.`
+          : '⚠️ This Overleaf project has no text files — starting from a blank main.tex.'
     );
   };
 
@@ -718,20 +947,21 @@ ${result.log}`);
     }
   };
 
-  const handleNewProject = () => {
-    const name = prompt('Enter project name:');
-    if (name) {
-      const project: OverleafProject = {
-        id: `local-${Date.now()}`,
-        name,
-        lastUpdated: new Date().toISOString(),
-        owner: 'Me',
-        isLocal: true,
-        syncStatus: 'offline-only'
-      };
-      overleafApi.addProject(project);
-      handleOpenProject(project);
-    }
+  const handleNewProject = () => setIsNewProjectOpen(true);
+
+  /** Creates a local project from a template, then opens it. */
+  const handleCreateProject = (name: string, template: ProjectTemplate) => {
+    setIsNewProjectOpen(false);
+    const project: OverleafProject = {
+      id: `local-${Date.now()}`,
+      name,
+      lastUpdated: new Date().toISOString(),
+      owner: 'Me',
+      isLocal: true,
+      syncStatus: 'offline-only'
+    };
+    overleafApi.addProject(project);
+    handleOpenProject(project, template);
   };
 
   const handleRestoreVersion = (snapshot: VersionSnapshot) => {
@@ -790,6 +1020,12 @@ ${result.log}`);
           onSaveCredentials={handleSaveCredentials}
           savedEmail={overleafAuth.getEmail()}
         />
+
+        <NewProjectModal
+          isOpen={isNewProjectOpen}
+          onClose={() => setIsNewProjectOpen(false)}
+          onCreate={handleCreateProject}
+        />
       </div>
     );
   }
@@ -816,6 +1052,8 @@ ${result.log}`);
         onRootDocumentChange={handleChooseRoot}
         autoCompile={autoCompile}
         onToggleAutoCompile={handleToggleAutoCompile}
+        collapsed={layout.collapsed}
+        onTogglePanel={toggle}
       />
 
       {notification && (
@@ -830,39 +1068,116 @@ ${result.log}`);
       )}
 
       <div className="workspace-container">
-        <FileTree
-          files={files}
-          activeFileId={activeFileId}
-          onSelectFile={setActiveFileId}
-          onNewFile={handleNewFile}
-          onDeleteFile={handleDeleteFile}
-          onOpenFolder={handleOpenFolder}
-          currentFolderPath={folderPath}
-        />
-
-        <div className="editor-pdf-split">
-          <LaTeXEditor
-            fileName={activeFile?.name || 'untitled.tex'}
-            content={activeFile?.content || ''}
-            onChange={handleContentChange}
-            citations={citations}
-            labels={labels}
-            revealLine={revealLine}
+        {layout.collapsed.files ? (
+          <CollapsedRail
+            label="Files"
+            side="left"
+            icon={<PanelLeft size={15} />}
+            onExpand={() => show('files')}
           />
+        ) : (
+          <>
+            <FileTree
+              files={files}
+              activeFileId={activeFileId}
+              onSelectFile={setActiveFileId}
+              onNewFile={handleNewFile}
+              onDeleteFile={handleDeleteFile}
+              onOpenFolder={handleOpenFolder}
+              currentFolderPath={folderPath}
+              width={layout.sidebarWidth}
+              assets={assets}
+              onAddImage={handleAddImageFile}
+              onInsertAsset={path => insertIntoEditor(figureBlock(path))}
+              onDeleteAsset={handleDeleteAsset}
+            />
+            <PaneDivider
+              onDrag={resizeSidebar}
+              onReset={() => reset('sidebar')}
+              title="File list width"
+            />
+          </>
+        )}
 
-          <PDFPreview
-            compiledUrl={compiledPdfUrl}
-            compileLog={compileLog}
-            isCompiling={isCompiling}
-            isPdf={compiledIsPdf}
-            onJumpToError={handleJumpToError}
-          />
+        <div className="editor-pdf-split" ref={splitRef}>
+          {!layout.collapsed.editor && (
+            <div
+              className="split-pane"
+              style={{
+                flex: layout.collapsed.pdf ? '1 1 auto' : `0 0 ${layout.editorRatio * 100}%`
+              }}
+            >
+              <LaTeXEditor
+                fileName={activeFile?.name || 'untitled.tex'}
+                content={activeFile?.content || ''}
+                onChange={handleContentChange}
+                citations={citations}
+                labels={labels}
+                revealLine={revealLine}
+                insertion={insertion}
+                onPasteImage={handlePasteImage}
+                wordCount={wordCount}
+                onOpenWordDetails={() => openPanel('words')}
+              />
+            </div>
+          )}
+
+          {!layout.collapsed.editor && !layout.collapsed.pdf && (
+            <PaneDivider
+              onDrag={delta => resizeSplit(delta, splitRef.current?.clientWidth || 0)}
+              onReset={() => reset('split')}
+              title="Editor and PDF"
+            />
+          )}
+
+          {!layout.collapsed.pdf && (
+            <div className="split-pane" style={{ flex: '1 1 auto' }}>
+              <PDFPreview
+                compiledUrl={compiledPdfUrl}
+                compileLog={compileLog}
+                isCompiling={isCompiling}
+                isPdf={compiledIsPdf}
+                onJumpToError={handleJumpToError}
+                onInstallPackage={handleInstallPackage}
+                installingPackage={installingPackage}
+              />
+            </div>
+          )}
         </div>
 
-        <VersionHistory
-          snapshots={snapshots}
-          onRestore={handleRestoreVersion}
-        />
+        {layout.collapsed.panel ? (
+          <CollapsedRail
+            label="Panel"
+            side="right"
+            icon={<PanelRight size={15} />}
+            onExpand={() => show('panel')}
+          />
+        ) : (
+          <>
+            <PaneDivider
+              onDrag={resizePanel}
+              onReset={() => reset('panel')}
+              title="Side panel width"
+            />
+            <SidePanel
+              width={layout.panelWidth}
+              tab={sidePanelTab}
+              onTabChange={setSidePanelTab}
+              onClose={() => toggle('panel')}
+              snapshots={snapshots}
+              onRestore={handleRestoreVersion}
+              todos={todos}
+              onOpenTodo={handleJumpToError}
+              onInsertSymbol={handleInsertSymbol}
+              fileName={activeFile?.name || 'untitled.tex'}
+              wordCount={wordCount}
+              sections={sections}
+              projectWords={projectWords}
+              onJumpToLine={line => setRevealLine({ line, nonce: Date.now() })}
+              writing={writingSummary}
+            />
+          </>
+        )}
       </div>
 
       <AuthModal

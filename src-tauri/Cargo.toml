@@ -1,6 +1,6 @@
 [package]
 name = "zabbleaf"
-version = "3.3.0"
+version = "3.4.0"
 description = "ZabbLeaf Desktop IDE by Diletta Abbonato (Zabbonat)"
 authors = ["Diletta Abbonato (Zabbonat)"]
 edition = "2021"

@@ -1,5 +1,5 @@
 import React from 'react';
-import { History, RotateCcw, FileText } from 'lucide-react';
+import { RotateCcw, FileText } from 'lucide-react';
 import { VersionSnapshot, VersionHistoryService } from '../../services/versionHistory';
 
 interface VersionHistoryProps {
@@ -7,31 +7,27 @@ interface VersionHistoryProps {
   onRestore: (snapshot: VersionSnapshot) => void;
 }
 
+/**
+ * Renders the list only: the panel around it, and its title, now come from the
+ * tabbed side panel this lives in.
+ */
 export const VersionHistory: React.FC<VersionHistoryProps> = ({
   snapshots,
   onRestore
 }) => {
   if (snapshots.length === 0) {
     return (
-      <div className="version-history-panel">
-        <div className="version-history-header">
-          <History size={16} color="#6fa8cc" />
-          <span>Version History</span>
-        </div>
-        <div style={{ padding: '24px 16px', textAlign: 'center', color: '#7b8593', fontSize: '0.8rem' }}>
-          No versions saved yet. Versions are created automatically when you compile.
-        </div>
+      <div className="panel-empty">
+        <p>No versions saved yet.</p>
+        <p className="panel-empty-hint">
+          One is written every time you compile, so offline changes can always be rolled back.
+        </p>
       </div>
     );
   }
 
   return (
-    <div className="version-history-panel">
-      <div className="version-history-header">
-        <History size={16} color="#6fa8cc" />
-        <span>Version History ({snapshots.length})</span>
-      </div>
-
+    <>
       <ul className="version-list">
         {snapshots.map((snapshot, index) => (
           <li key={snapshot.id} className="version-item">
@@ -68,6 +64,6 @@ export const VersionHistory: React.FC<VersionHistoryProps> = ({
           </li>
         ))}
       </ul>
-    </div>
+    </>
   );
 };

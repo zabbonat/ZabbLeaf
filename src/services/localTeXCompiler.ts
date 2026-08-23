@@ -113,6 +113,22 @@ export class LocalTeXCompilerService {
   }
 
   /**
+   * Installs one missing LaTeX package.
+   *
+   * `File 'booktabs.sty' not found` is the most common way a compile fails on a
+   * fresh machine, and the fix is always the same command nobody remembers —
+   * mpm on MiKTeX, tlmgr on TeX Live. The backend picks whichever is there.
+   */
+  async installPackage(packageName: string): Promise<InstallResult> {
+    try {
+      return await invoke<InstallResult>('zl_install_package', { package: packageName });
+    } catch (err: any) {
+      const message = String(err?.message || err);
+      return { success: false, message, log: message };
+    }
+  }
+
+  /**
    * Downloads and installs a TeX distribution. Only ever call this from an
    * explicit user action — it installs system software and takes minutes.
    */

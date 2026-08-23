@@ -22,5 +22,6 @@ release
 .DS_Store
 .vscode/
 .idea/
+.claude/
 *.suo
 *.user

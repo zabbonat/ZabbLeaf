@@ -1,6 +1,22 @@
 import React, { useState, useEffect } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
-import { RefreshCw, Wifi, WifiOff, Play, UserCheck, FolderGit2, Home, ChevronDown, LogOut, Repeat } from 'lucide-react';
+import {
+  RefreshCw,
+  Wifi,
+  WifiOff,
+  Play,
+  UserCheck,
+  FolderGit2,
+  Home,
+  ChevronDown,
+  LogOut,
+  Repeat,
+  PanelLeft,
+  PanelRight,
+  FileCode2,
+  FileText
+} from 'lucide-react';
+import { PanelKey } from '../../hooks/usePanelLayout';
 
 export type CompilerEngine = 'html-preview' | 'overleaf-cloud' | 'pdflatex' | 'xelatex' | 'lualatex';
 
@@ -33,6 +49,9 @@ interface SyncToolbarProps {
   /** Every file with its own preamble, so a project can hold several. */
   rootDocuments: string[];
   onRootDocumentChange: (fileName: string) => void;
+  /** Which panels are currently hidden. */
+  collapsed: Record<PanelKey, boolean>;
+  onTogglePanel: (key: PanelKey) => void;
 }
 
 export const SyncToolbar: React.FC<SyncToolbarProps> = ({
@@ -53,9 +72,20 @@ export const SyncToolbar: React.FC<SyncToolbarProps> = ({
   onToggleAutoCompile,
   rootDocument,
   rootDocuments,
-  onRootDocumentChange
+  onRootDocumentChange,
+  collapsed,
+  onTogglePanel
 }) => {
   const selectedOption = compilerOptions.find(c => c.id === selectedCompiler);
+
+  // Four switches for the four columns. Shown as pressed when the panel is
+  // open, which is the state people read off a toolbar without thinking.
+  const PANEL_BUTTONS: { key: PanelKey; icon: React.ReactNode; label: string; hint: string }[] = [
+    { key: 'files', icon: <PanelLeft size={14} />, label: 'Files', hint: 'file list (Ctrl+B)' },
+    { key: 'editor', icon: <FileCode2 size={14} />, label: 'Editor', hint: 'editor' },
+    { key: 'pdf', icon: <FileText size={14} />, label: 'PDF', hint: 'PDF preview' },
+    { key: 'panel', icon: <PanelRight size={14} />, label: 'Panel', hint: 'side panel (Ctrl+J)' }
+  ];
 
   // Read from tauri.conf.json rather than hardcoded: the badge had drifted to
   // "v2.1" while releases were already at v3.1.
@@ -93,6 +123,20 @@ export const SyncToolbar: React.FC<SyncToolbarProps> = ({
       </div>
 
       <div className="toolbar-controls">
+        <div className="panel-toggles">
+          {PANEL_BUTTONS.map(button => (
+            <button
+              key={button.key}
+              className={`panel-toggle ${collapsed[button.key] ? '' : 'active'}`}
+              onClick={() => onTogglePanel(button.key)}
+              title={`${collapsed[button.key] ? 'Show' : 'Hide'} the ${button.hint}`}
+              aria-pressed={!collapsed[button.key]}
+            >
+              {button.icon}
+            </button>
+          ))}
+        </div>
+
         <div className="status-indicator">
           {isOnline ? (
             <>

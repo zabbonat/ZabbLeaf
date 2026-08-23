@@ -184,6 +184,10 @@ body {
   border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
+  /* The width now comes from the layout, and the column no longer squeezes. */
+  flex-shrink: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 .sidebar-header {
@@ -202,8 +206,9 @@ body {
 .file-list {
   list-style: none;
   padding: 8px 0;
-  overflow-y: auto;
-  flex: 1;
+  /* Two lists share this column now — sources and figures — so the sidebar
+     scrolls as a whole rather than each list fighting for the same space. */
+  flex: 0 0 auto;
 }
 
 .file-item {

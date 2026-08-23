@@ -1,5 +1,7 @@
-import React, { useState } from 'react';
-import { ZoomIn, ZoomOut, Download, FileCheck, Terminal } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { ZoomIn, ZoomOut, Download, FileCheck, Terminal, ChevronDown, ChevronRight } from 'lucide-react';
+import { explainLog } from '../../services/latexErrors';
+import { CompileProblems } from './CompileProblems';
 
 interface PDFPreviewProps {
   compiledUrl: string | null;
@@ -9,6 +11,10 @@ interface PDFPreviewProps {
   isPdf?: boolean;
   /** Called when a compiler error line is clicked. */
   onJumpToError?: (fileName: string, line: number) => void;
+  /** Installs a package a diagnostic says is missing. */
+  onInstallPackage?: (packageName: string) => void;
+  /** The package currently being installed, if any. */
+  installingPackage?: string;
 }
 
 export const PDFPreview: React.FC<PDFPreviewProps> = ({
@@ -16,9 +22,16 @@ export const PDFPreview: React.FC<PDFPreviewProps> = ({
   compileLog,
   isCompiling,
   isPdf = false,
-  onJumpToError
+  onJumpToError,
+  onInstallPackage,
+  installingPackage = ''
 }) => {
   const [zoom, setZoom] = useState(100);
+  const [showRawLog, setShowRawLog] = useState(false);
+
+  // Reading a 2,000-line log for the one line that matters is the worst part of
+  // compiling locally, so the log is explained first and shown second.
+  const diagnostics = useMemo(() => explainLog(compileLog), [compileLog]);
 
   const handleZoomIn = () => setZoom(prev => Math.min(prev + 15, 200));
   const handleZoomOut = () => setZoom(prev => Math.max(prev - 15, 50));
@@ -76,12 +89,31 @@ export const PDFPreview: React.FC<PDFPreviewProps> = ({
         )}
       </div>
 
+      {diagnostics.length > 0 && (
+        <div className="problems-pane">
+          <CompileProblems
+            diagnostics={diagnostics}
+            onJump={(fileName, line) => {
+              if (line && onJumpToError) onJumpToError(fileName || '', line);
+            }}
+            onInstallPackage={packageName => onInstallPackage?.(packageName)}
+            installing={installingPackage}
+          />
+        </div>
+      )}
+
       {compileLog && (
         <div className="compile-log">
-          <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '4px', color: '#7b8593' }}>
-            <Terminal size={12} /> Compiler Output
-          </div>
-          {compileLog.split('\n').map((line, index) => {
+          <button
+            className="compile-log-toggle"
+            onClick={() => setShowRawLog(current => !current)}
+            title="The unedited output of the TeX engine"
+          >
+            {showRawLog ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            <Terminal size={12} /> Compiler output
+          </button>
+
+          {showRawLog && compileLog.split('\n').map((line, index) => {
             // -file-line-error makes the engine print "main.tex:37: message",
             // which is enough to jump straight to the offending line.
             const hit = line.match(/^([^\s:]+\.(?:tex|sty|cls|bib)):(\d+):\s*(.*)$/);

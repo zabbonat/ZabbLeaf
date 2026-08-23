@@ -779,6 +779,208 @@ fn zl_delete_project(project_id: String) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Assets (figures)
+// ---------------------------------------------------------------------------
+
+/// Files a LaTeX project carries but the editor cannot open as text. They are
+/// invisible to `zl_read_project_files`, which is why pasting a screenshot used
+/// to mean leaving the app and copying it in with the file manager.
+const ASSET_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "tif", "tiff", "svg", "eps", "pdf",
+];
+
+/// Nothing bigger goes into a Git repository without the user meaning it.
+const MAX_ASSET_BYTES: u64 = 25 * 1024 * 1024;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectAsset {
+    name: String,
+    bytes: u64,
+}
+
+fn is_asset_file(path: &Path) -> bool {
+    path.extension()
+        .map(|ext| {
+            let ext = ext.to_string_lossy().to_lowercase();
+            ASSET_EXTENSIONS.iter().any(|known| *known == ext)
+        })
+        .unwrap_or(false)
+}
+
+fn collect_assets(root: &Path, dir: &Path, out: &mut Vec<ProjectAsset>) -> Result<(), String> {
+    let entries =
+        fs::read_dir(dir).map_err(|e| format!("Cannot read {}: {}", dir.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Cannot read {}: {}", dir.display(), e))?;
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Cannot stat {}: {}", path.display(), e))?;
+
+        if file_type.is_dir() {
+            collect_assets(root, &path, out)?;
+        } else if file_type.is_file() && is_asset_file(&path) {
+            out.push(ProjectAsset {
+                name: path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                bytes: entry.metadata().map(|m| m.len()).unwrap_or(0),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn zl_list_project_assets(project_id: String) -> Result<Vec<ProjectAsset>, String> {
+    let dir = project_dir(&project_id)?;
+    let mut assets = Vec::new();
+    if !dir.is_dir() {
+        return Ok(assets);
+    }
+    collect_assets(&dir, &dir, &mut assets)?;
+    assets.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(assets)
+}
+
+/// Adds `-1`, `-2`, … to a name rather than overwriting a figure that a
+/// document may already reference.
+fn unique_asset_path(dir: &Path, rel_path: &str) -> Result<(PathBuf, String), String> {
+    let candidate = safe_join(dir, rel_path)?;
+    if !candidate.exists() {
+        return Ok((candidate, rel_path.replace('\\', "/")));
+    }
+
+    let normalized = rel_path.replace('\\', "/");
+    let (stem, extension) = match normalized.rsplit_once('.') {
+        Some((stem, ext)) => (stem.to_string(), format!(".{}", ext)),
+        None => (normalized.clone(), String::new()),
+    };
+
+    for suffix in 1..1000 {
+        let next = format!("{}-{}{}", stem, suffix, extension);
+        let path = safe_join(dir, &next)?;
+        if !path.exists() {
+            return Ok((path, next));
+        }
+    }
+    Err(format!("Too many files named like {}", rel_path))
+}
+
+/// Writes a pasted image into the project. Returns the path it actually got,
+/// which is what the `\includegraphics` line has to say.
+#[tauri::command]
+fn zl_write_project_asset(
+    project_id: String,
+    rel_path: String,
+    base64_data: String,
+) -> Result<String, String> {
+    use base64::Engine as _;
+
+    let dir = project_dir(&project_id)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {}", dir.display(), e))?;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data.trim())
+        .map_err(|e| format!("That image could not be decoded: {}", e))?;
+    if bytes.len() as u64 > MAX_ASSET_BYTES {
+        return Err(format!(
+            "That file is {} MB. The limit is {} MB, because it ends up in your Overleaf repository.",
+            bytes.len() / (1024 * 1024),
+            MAX_ASSET_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let (target, name) = unique_asset_path(&dir, &rel_path)?;
+    if !is_asset_file(&target) {
+        return Err(format!("{} is not an image ZabbLeaf can store.", rel_path));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create {}: {}", parent.display(), e))?;
+    }
+    fs::write(&target, &bytes)
+        .map_err(|e| format!("Cannot write {}: {}", target.display(), e))?;
+    Ok(name)
+}
+
+/// Copies a file dragged in from the desktop. The webview only hands us the
+/// path, so the copying has to happen on this side.
+#[tauri::command]
+fn zl_import_project_asset(
+    project_id: String,
+    source_path: String,
+    dest_dir: String,
+) -> Result<String, String> {
+    let source = PathBuf::from(&source_path);
+    if !source.is_file() {
+        return Err(format!("{} is not a file.", source_path));
+    }
+    if !is_asset_file(&source) {
+        return Err(format!(
+            "{} is not an image. Drop a PNG, JPG, PDF or EPS instead.",
+            source
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or(source_path.clone())
+        ));
+    }
+    let size = source.metadata().map(|m| m.len()).unwrap_or(0);
+    if size > MAX_ASSET_BYTES {
+        return Err(format!(
+            "That file is {} MB. The limit is {} MB, because it ends up in your Overleaf repository.",
+            size / (1024 * 1024),
+            MAX_ASSET_BYTES / (1024 * 1024)
+        ));
+    }
+
+    let file_name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "That file has no name.".to_string())?;
+    let dir = project_dir(&project_id)?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {}", dir.display(), e))?;
+
+    let wanted = if dest_dir.trim().is_empty() {
+        file_name
+    } else {
+        format!("{}/{}", dest_dir.trim_end_matches('/'), file_name)
+    };
+    let (target, name) = unique_asset_path(&dir, &wanted)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create {}: {}", parent.display(), e))?;
+    }
+    fs::copy(&source, &target)
+        .map_err(|e| format!("Cannot copy {} into the project: {}", source_path, e))?;
+    Ok(name)
+}
+
+/// Reads one figure back out, base64 encoded, so the file tree can preview it.
+#[tauri::command]
+fn zl_read_project_asset(project_id: String, rel_path: String) -> Result<String, String> {
+    let dir = project_dir(&project_id)?;
+    let target = safe_join(&dir, &rel_path)?;
+    if !target.is_file() {
+        return Err(format!("{} is not in this project.", rel_path));
+    }
+    if target.metadata().map(|m| m.len()).unwrap_or(0) > MAX_ASSET_BYTES {
+        return Err(format!("{} is too large to preview.", rel_path));
+    }
+    let bytes =
+        fs::read(&target).map_err(|e| format!("Cannot read {}: {}", target.display(), e))?;
+    Ok(base64_encode(&bytes))
+}
+
+// ---------------------------------------------------------------------------
 // Local LaTeX compilation
 // ---------------------------------------------------------------------------
 
@@ -1181,6 +1383,74 @@ fn install_git_for_platform() -> Result<InstallOutcome, String> {
     })
 }
 
+/// Installs one missing LaTeX package, the fix for by far the most common
+/// compile failure: `File \`booktabs.sty' not found`.
+///
+/// MiKTeX fetches packages on its own when `-enable-installer` is passed, so
+/// this is mostly for TeX Live — and for the MiKTeX cases where the automatic
+/// install was declined earlier.
+#[tauri::command]
+fn zl_install_package(package: String) -> Result<InstallOutcome, String> {
+    // Straight onto a command line, so nothing but a package name gets through.
+    let name = package.trim().to_string();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err(format!("{} is not a valid package name.", package));
+    }
+
+    let (program, version) = resolve_engine("pdflatex")
+        .or_else(|| resolve_engine("xelatex"))
+        .or_else(|| resolve_engine("lualatex"))
+        .ok_or_else(|| {
+            "No TeX distribution found. Install one before installing packages.".to_string()
+        })?;
+
+    // The manager sits beside the engine; PATH may not have caught up yet.
+    let beside = |tool: &str| {
+        Path::new(&program)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|dir| dir.join(engine_file_name(tool)).to_string_lossy().to_string())
+            .unwrap_or_else(|| tool.to_string())
+    };
+
+    let is_miktex = version.to_lowercase().contains("miktex");
+    let (manager, args) = if is_miktex {
+        (beside("mpm"), vec![format!("--install={}", name)])
+    } else {
+        (beside("tlmgr"), vec!["install".to_string(), name.clone()])
+    };
+
+    let (code, log) = run_tool(&manager, &args, &std::env::temp_dir(), &[])?;
+    if code == 0 {
+        return Ok(InstallOutcome {
+            success: true,
+            message: format!("Installed {}. Recompile to use it.", name),
+            log,
+        });
+    }
+
+    // tlmgr writes into the distribution, which a system-packaged TeX Live only
+    // lets root do. Saying so beats showing a bare permission error.
+    let message = if is_miktex {
+        format!("MiKTeX could not install {}. See the log below.", name)
+    } else {
+        format!(
+            "tlmgr could not install {}. On a distribution-packaged TeX Live this needs your package manager (e.g. apt install texlive-latex-extra) or sudo tlmgr.",
+            name
+        )
+    };
+    Ok(InstallOutcome {
+        success: false,
+        message,
+        log,
+    })
+}
+
 /// Installs a TeX distribution so the user can produce real PDFs offline.
 ///
 /// Deliberately user-initiated: this downloads and installs system software,
@@ -1384,6 +1654,33 @@ mod tests {
     }
 
     #[test]
+    fn only_real_image_formats_are_treated_as_figures() {
+        assert!(is_asset_file(Path::new("figures/plot.PNG")));
+        assert!(is_asset_file(Path::new("diagram.eps")));
+        assert!(!is_asset_file(Path::new("main.tex")));
+        assert!(!is_asset_file(Path::new("notes")));
+    }
+
+    /// A pasted image must never overwrite a figure the document already
+    /// references, so the second one is renamed rather than silently replacing
+    /// the first.
+    #[test]
+    fn a_second_image_with_the_same_name_gets_a_suffix() {
+        let dir = std::env::temp_dir().join(format!("zabbleaf-test-{}", std::process::id()));
+        fs::create_dir_all(dir.join("figures")).unwrap();
+
+        let (first, name) = unique_asset_path(&dir, "figures/plot.png").unwrap();
+        assert_eq!(name, "figures/plot.png");
+        fs::write(&first, b"x").unwrap();
+
+        let (second, name) = unique_asset_path(&dir, "figures/plot.png").unwrap();
+        assert_eq!(name, "figures/plot-1.png");
+        assert!(!second.exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn relative_paths_cannot_escape_the_project_dir() {
         let base = Path::new("/projects/abc");
         assert!(safe_join(base, "../secrets.txt").is_err());
@@ -1519,7 +1816,12 @@ fn main() {
             zl_install_git,
             zl_detect_engines,
             zl_compile_project,
-            zl_install_tex
+            zl_install_tex,
+            zl_install_package,
+            zl_list_project_assets,
+            zl_write_project_asset,
+            zl_import_project_asset,
+            zl_read_project_asset
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
