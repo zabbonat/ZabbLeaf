@@ -61,6 +61,27 @@ export class GitSyncService {
     return this.gitVersion;
   }
 
+  /**
+   * Installs git. Unlike a TeX engine this one is not optional: without it
+   * ZabbLeaf cannot reach Overleaf at all.
+   */
+  async installGit(): Promise<{ success: boolean; message: string; log: string }> {
+    try {
+      const result = await invoke<{ success: boolean; message: string; log: string }>('zl_install_git');
+      if (result.success) {
+        try {
+          this.gitVersion = await invoke<string>('zl_git_available');
+        } catch {
+          // Installed but still not reachable; the caller reports the message.
+        }
+      }
+      return result;
+    } catch (err: any) {
+      const message = String(err?.message || err);
+      return { success: false, message, log: message };
+    }
+  }
+
   getProjectsRoot(): string {
     return this.projectsRoot;
   }
@@ -166,6 +187,16 @@ export class GitSyncService {
     }
   }
 
+  /** What a sync would publish: the changed files and a unified diff. */
+  async getChanges(projectId: string): Promise<{ files: string[]; diff: string }> {
+    try {
+      return await invoke<{ files: string[]; diff: string }>('zl_project_changes', { projectId });
+    } catch (err) {
+      console.error('[GitSync] Could not read changes:', err);
+      return { files: [], diff: '' };
+    }
+  }
+
   /** Reads every text file in the project, recursively. */
   async readProjectFiles(projectId: string): Promise<ProjectFile[]> {
     try {
@@ -183,6 +214,15 @@ export class GitSyncService {
       await invoke('zl_write_project_file', { projectId, relPath: fileName, content });
     } catch (err) {
       console.error(`[GitSync] Could not write ${fileName}:`, err);
+    }
+  }
+
+  /** Removes one file from disk, so git sees the deletion on the next sync. */
+  async deleteFile(projectId: string, fileName: string): Promise<void> {
+    try {
+      await invoke('zl_delete_project_file', { projectId, relPath: fileName });
+    } catch (err) {
+      console.error(`[GitSync] Could not delete ${fileName}:`, err);
     }
   }
 

@@ -52,6 +52,8 @@ With the network gone the toolbar switches to **Offline Mode** — and a local e
 
 **Sync Overleaf** commits your local changes, rebases onto whatever happened on Overleaf meanwhile, and pushes. Build files (`.aux`, `.log`, `.pdf`) are written outside the repository, so they are never pushed to your project.
 
+Because this is a real rebase, edits on different lines merge on their own, even inside the same file. When Overleaf changed the same lines you did, the rebase is undone rather than guessing a winner: your commit stays intact, the working tree is left clean with no conflict markers, and nothing is pushed. There is no conflict resolution screen yet, so you settle it in `~/.zabbleaf/projects/<projectId>/` with git and sync again.
+
 A project you create with **Blank** exists only on your computer at first. Overleaf's Git interface cannot create projects, so to sync one you make an empty project on overleaf.com and let ZabbLeaf link the two — it offers to do this the first time you press **Sync Overleaf**.
 
 ---

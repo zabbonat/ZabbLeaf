@@ -5,11 +5,18 @@ import { LaTeXEditor } from './components/Editor/LaTeXEditor';
 import { PDFPreview } from './components/PDFViewer/PDFPreview';
 import { AuthModal } from './components/AuthModal/AuthModal';
 import { ProjectList } from './components/ProjectList/ProjectList';
-import { LaTeXSetupBanner, LaTeXReadyNotice } from './components/LaTeXSetup/LaTeXSetupBanner';
+import { ChangesModal } from './components/ChangesModal/ChangesModal';
+import { LaTeXSetupBanner, LaTeXReadyNotice, GitMissingBanner } from './components/LaTeXSetup/LaTeXSetupBanner';
 import { VersionHistory } from './components/VersionHistory/VersionHistory';
 import { overleafAuth } from './services/overleafAuth';
 import { OverleafProject, overleafApi, isPlaceholderName } from './services/overleafApi';
 import { latexCompiler, deriveProjectName } from './services/latexCompiler';
+import {
+  collectCitations,
+  collectLabels,
+  findRootDocuments,
+  defaultRootDocument
+} from './services/latexSymbols';
 import { overleafCompiler } from './services/overleafCompiler';
 import { localTeXCompiler, TeXEngine, DetectedEngine } from './services/localTeXCompiler';
 import { versionHistory, VersionSnapshot } from './services/versionHistory';
@@ -75,13 +82,38 @@ export const App: React.FC = () => {
   const [selectedCompiler, setSelectedCompiler] = useState<CompilerEngine>('html-preview');
   const [detectedLocalEngines, setDetectedLocalEngines] = useState<DetectedEngine[]>([]);
   const [isInstallingTex, setIsInstallingTex] = useState<boolean>(false);
+  const [isGitMissing, setIsGitMissing] = useState<boolean>(false);
+  const [isInstallingGit, setIsInstallingGit] = useState<boolean>(false);
   const [texJustInstalled, setTexJustInstalled] = useState<string>('');
+  // Which file gets compiled. Not necessarily main.tex, and not necessarily the
+  // one being edited: a chapter fragment has no preamble of its own.
+  const [chosenRoot, setChosenRoot] = useState<string>('');
+  const [changes, setChanges] = useState<{ files: string[]; diff: string } | null>(null);
+  const [revealLine, setRevealLine] = useState<{ line: number; nonce: number } | null>(null);
+  const [autoCompile, setAutoCompile] = useState<boolean>(
+    () => localStorage.getItem('zabbleaf_auto_compile') !== '0'
+  );
   const [texSetupDismissed, setTexSetupDismissed] = useState<boolean>(
     () => localStorage.getItem('zabbleaf_tex_setup_dismissed') === '1'
   );
 
+  // The online handler is registered once at mount, so it must read the current
+  // project through refs rather than a value captured back then.
+  const currentProjectRef = useRef<OverleafProject | null>(null);
+  currentProjectRef.current = currentProject;
+  const isSyncingRef = useRef(false);
+  isSyncingRef.current = isSyncing;
+
   const activeFile = files.find(f => f.id === activeFileId) || files[0];
+  const projectFiles = files.map(f => ({ name: f.name, content: f.content || '' }));
+  const citations = collectCitations(projectFiles);
+  const labels = collectLabels(projectFiles);
+  const rootDocuments = findRootDocuments(projectFiles);
   const projectId = currentProject?.id || 'local-default';
+  const rootDocument =
+    chosenRoot && files.some(f => f.name === chosenRoot)
+      ? chosenRoot
+      : defaultRootDocument(rootDocuments, activeFile?.name || '');
 
   // Initialize git sync engine and detect local TeX installations on startup
   useEffect(() => {
@@ -89,9 +121,7 @@ export const App: React.FC = () => {
       // Credentials live in the sync engine, so the header must reflect what it
       // actually restored rather than a stale "logged in" flag.
       setIsLoggedIn(!!gitSyncEngine.getCredentials()?.gitToken);
-      if (!gitSyncEngine.getGitVersion()) {
-        showNotification('⚠️ git was not found on this system. Install Git to download Overleaf projects.');
-      }
+      setIsGitMissing(!gitSyncEngine.getGitVersion());
     }).catch(console.error);
 
     localTeXCompiler.detectEngines().then(applyDetectedEngines);
@@ -121,6 +151,25 @@ export const App: React.FC = () => {
       setCompileLog(`${result.message}\n\n${result.log}`);
       showNotification(`❌ ${result.message}`);
     }
+  };
+
+  const handleInstallGit = async () => {
+    setIsInstallingGit(true);
+    setNotification('⬇️ Installing git...');
+
+    const result = await gitSyncEngine.installGit();
+    setIsInstallingGit(false);
+    setIsGitMissing(!gitSyncEngine.getGitVersion());
+
+    showNotification(result.success ? `✅ ${result.message}` : `❌ ${result.message}`);
+    if (!result.success) setCompileLog(`${result.message}
+
+${result.log}`);
+  };
+
+  const handleChooseRoot = (fileName: string) => {
+    setChosenRoot(fileName);
+    localStorage.setItem(`zabbleaf_root_${projectId}`, fileName);
   };
 
   const handleDismissTexSetup = () => {
@@ -165,7 +214,10 @@ export const App: React.FC = () => {
   useEffect(() => {
     const handleOnline = () => {
       setIsOnline(true);
-      showNotification('📶 Network connection restored. Ready to sync with Overleaf!');
+      showNotification('📶 Back online.');
+      // The whole point of the app: pending work goes up on its own as soon as
+      // there is a connection, without waiting for anyone to press a button.
+      void syncPendingOnReconnect();
     };
     const handleOffline = () => {
       setIsOnline(false);
@@ -257,7 +309,7 @@ export const App: React.FC = () => {
       // Local TeX compilation (pdflatex, xelatex, lualatex). The engine reads
       // files from disk, so flush the editor first — and compile the whole
       // project directory so \input, .bib and class files resolve.
-      const fileName = activeFile?.name || 'main.tex';
+      const fileName = rootDocument;
       for (const f of files) {
         await gitSyncEngine.writeFile(projectId, f.name, f.content || '');
       }
@@ -276,7 +328,7 @@ export const App: React.FC = () => {
         showNotification(`❌ ${result.errors[0] || `${selectedCompiler} compilation failed.`}`);
       }
     }
-  }, [activeFile, currentProject, files, projectId, selectedCompiler]);
+  }, [activeFile, currentProject, files, projectId, selectedCompiler, rootDocument]);
 
   /**
    * Attaches a locally-created project to an existing Overleaf project.
@@ -362,6 +414,49 @@ export const App: React.FC = () => {
     return remoteId;
   };
 
+  const autoCompileTimer = useRef<number | undefined>(undefined);
+
+  useEffect(() => {
+    // Deliberately never for 'overleaf-cloud': that engine pushes to the real
+    // project, which must stay a decision, not a side effect of typing.
+    if (!autoCompile || selectedCompiler === 'overleaf-cloud') return;
+    if (currentView !== 'editor' || isCompiling) return;
+
+    window.clearTimeout(autoCompileTimer.current);
+    autoCompileTimer.current = window.setTimeout(() => handleCompile(), 2000);
+    return () => window.clearTimeout(autoCompileTimer.current);
+  }, [activeFile?.content, activeFileId, autoCompile, selectedCompiler, currentView]);
+
+  const handleToggleAutoCompile = () => {
+    const next = !autoCompile;
+    setAutoCompile(next);
+    localStorage.setItem('zabbleaf_auto_compile', next ? '1' : '0');
+  };
+
+  /** Pushes silently when the network returns, if there is anything waiting. */
+  const syncPendingOnReconnect = async () => {
+    const project = currentProjectRef.current;
+    if (!project || isSyncingRef.current) return;
+    if (!gitSyncEngine.getCredentials()?.gitToken) return;
+    if (!(await gitSyncEngine.hasProject(project.id))) return;
+
+    const pending = await gitSyncEngine.getChanges(project.id);
+    if (pending.files.length === 0) return;
+
+    setIsSyncing(true);
+    setNotification('🔄 Back online — syncing your changes...');
+    const result = await gitSyncEngine.syncProject(project.id);
+    setIsSyncing(false);
+    showNotification(result.success ? `✅ ${result.message}` : `❌ ${result.message}`);
+  };
+
+  /** Opens a compiler error's file at its line. */
+  const handleJumpToError = (fileName: string, line: number) => {
+    const target = files.find(f => f.name === fileName || f.name.endsWith(`/${fileName}`));
+    if (target) setActiveFileId(target.id);
+    setRevealLine({ line, nonce: Date.now() });
+  };
+
   const handleSync = async () => {
     if (!currentProject) return;
 
@@ -400,6 +495,17 @@ export const App: React.FC = () => {
         }
       }
     }
+
+    // Show what is about to go up before it goes up.
+    for (const f of files) {
+      if (f.isModified) await gitSyncEngine.writeFile(syncId, f.name, f.content || '');
+    }
+    const pending = await gitSyncEngine.getChanges(syncId);
+    if (pending.files.length > 0 && !changes) {
+      setChanges(pending);
+      return;
+    }
+    setChanges(null);
 
     setIsSyncing(true);
     setNotification('🔄 Syncing with Overleaf...');
@@ -487,12 +593,24 @@ export const App: React.FC = () => {
 
   const handleDeleteFile = (idToDelete: string) => {
     if (files.length <= 1) return;
-    const name = files.find(f => f.id === idToDelete)?.name;
+    const target = files.find(f => f.id === idToDelete);
+    if (!target) return;
+
+    if (!window.confirm(`Delete "${target.name}"?\n\nIt is removed from your computer, and from Overleaf on the next sync.`)) {
+      return;
+    }
+
     setFiles(prev => prev.filter(f => f.id !== idToDelete));
     if (activeFileId === idToDelete) {
       setActiveFileId(files.filter(f => f.id !== idToDelete)[0].id);
     }
-    showNotification(`🗑️ Deleted "${name}"`);
+
+    // Also remove it from disk. Dropping it from the list alone left the file
+    // in place, so git saw no deletion and it reappeared on the next open.
+    if (currentProject) {
+      gitSyncEngine.deleteFile(currentProject.id, target.name).catch(console.error);
+    }
+    showNotification(`🗑️ Deleted "${target.name}"`);
   };
 
   const handleOpenFolder = async () => {
@@ -514,6 +632,8 @@ export const App: React.FC = () => {
     setFiles([]);
     setActiveFileId('');
     overleafApi.addProject(project);
+
+    setChosenRoot(localStorage.getItem(`zabbleaf_root_${project.id}`) || '');
 
     const alreadyOnDisk = await gitSyncEngine.hasProject(project.id);
     console.log(`[OPEN-PROJECT] Already cloned: ${alreadyOnDisk}`);
@@ -638,6 +758,9 @@ export const App: React.FC = () => {
           </div>
         )}
         <div style={{ padding: '0 32px' }}>
+          {isGitMissing && (
+            <GitMissingBanner isInstalling={isInstallingGit} onInstall={handleInstallGit} />
+          )}
           {texJustInstalled ? (
             <LaTeXReadyNotice version={texJustInstalled} />
           ) : (
@@ -688,6 +811,11 @@ export const App: React.FC = () => {
         selectedCompiler={selectedCompiler}
         compilerOptions={compilerOptions}
         onCompilerChange={setSelectedCompiler}
+        rootDocument={rootDocument}
+        rootDocuments={rootDocuments}
+        onRootDocumentChange={handleChooseRoot}
+        autoCompile={autoCompile}
+        onToggleAutoCompile={handleToggleAutoCompile}
       />
 
       {notification && (
@@ -717,6 +845,9 @@ export const App: React.FC = () => {
             fileName={activeFile?.name || 'untitled.tex'}
             content={activeFile?.content || ''}
             onChange={handleContentChange}
+            citations={citations}
+            labels={labels}
+            revealLine={revealLine}
           />
 
           <PDFPreview
@@ -724,6 +855,7 @@ export const App: React.FC = () => {
             compileLog={compileLog}
             isCompiling={isCompiling}
             isPdf={compiledIsPdf}
+            onJumpToError={handleJumpToError}
           />
         </div>
 
@@ -738,6 +870,16 @@ export const App: React.FC = () => {
         onClose={() => setIsAuthOpen(false)}
         onSaveCredentials={handleSaveCredentials}
         savedEmail={overleafAuth.getEmail()}
+      />
+
+      <ChangesModal
+        isOpen={!!changes}
+        projectName={currentProject?.name || 'Overleaf'}
+        files={changes?.files || []}
+        diff={changes?.diff || ''}
+        isSyncing={isSyncing}
+        onConfirm={handleSync}
+        onClose={() => setChanges(null)}
       />
     </div>
   );

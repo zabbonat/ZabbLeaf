@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getVersion } from '@tauri-apps/api/app';
-import { RefreshCw, Wifi, WifiOff, Play, UserCheck, FolderGit2, Home, ChevronDown, LogOut } from 'lucide-react';
+import { RefreshCw, Wifi, WifiOff, Play, UserCheck, FolderGit2, Home, ChevronDown, LogOut, Repeat } from 'lucide-react';
 
 export type CompilerEngine = 'html-preview' | 'overleaf-cloud' | 'pdflatex' | 'xelatex' | 'lualatex';
 
@@ -25,6 +25,14 @@ interface SyncToolbarProps {
   selectedCompiler: CompilerEngine;
   compilerOptions: CompilerOption[];
   onCompilerChange: (compiler: CompilerEngine) => void;
+  /** Recompile a couple of seconds after typing stops. */
+  autoCompile: boolean;
+  onToggleAutoCompile: () => void;
+  /** The file that actually gets compiled. */
+  rootDocument: string;
+  /** Every file with its own preamble, so a project can hold several. */
+  rootDocuments: string[];
+  onRootDocumentChange: (fileName: string) => void;
 }
 
 export const SyncToolbar: React.FC<SyncToolbarProps> = ({
@@ -40,7 +48,12 @@ export const SyncToolbar: React.FC<SyncToolbarProps> = ({
   projectName,
   selectedCompiler,
   compilerOptions,
-  onCompilerChange
+  onCompilerChange,
+  autoCompile,
+  onToggleAutoCompile,
+  rootDocument,
+  rootDocuments,
+  onRootDocumentChange
 }) => {
   const selectedOption = compilerOptions.find(c => c.id === selectedCompiler);
 
@@ -137,9 +150,46 @@ export const SyncToolbar: React.FC<SyncToolbarProps> = ({
           />
         </div>
 
+        {rootDocuments.length > 1 && (
+          <select
+            value={rootDocument}
+            onChange={(e) => onRootDocumentChange(e.target.value)}
+            title="Which document gets compiled. A project can hold more than one."
+            style={{
+              appearance: 'none',
+              background: 'rgba(38, 43, 50, 0.8)',
+              border: '1px solid #39404a',
+              color: '#ccd2da',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontSize: '0.8rem',
+              cursor: 'pointer',
+              maxWidth: '170px'
+            }}
+          >
+            {rootDocuments.map(name => (
+              <option key={name} value={name}>{name}</option>
+            ))}
+          </select>
+        )}
+
         <button className="btn-secondary" onClick={onCompile} disabled={isCompiling}>
           <Play size={14} fill="#6fa8cc" color="#6fa8cc" />
           {isCompiling ? 'Compiling...' : 'Recompile'}
+        </button>
+
+        <button
+          className="btn-secondary"
+          onClick={onToggleAutoCompile}
+          title={
+            autoCompile
+              ? 'Recompiling automatically after you stop typing. Click to turn off.'
+              : 'Automatic recompiling is off. Click to turn on.'
+          }
+          style={{ padding: '6px 10px', opacity: autoCompile ? 1 : 0.55 }}
+        >
+          <Repeat size={14} color={autoCompile ? '#6fa8cc' : '#7b8593'} />
+          Auto
         </button>
 
         <button className="btn-sync" onClick={onSync} disabled={isSyncing}>

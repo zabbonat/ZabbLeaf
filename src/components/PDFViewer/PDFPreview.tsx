@@ -7,13 +7,16 @@ interface PDFPreviewProps {
   isCompiling: boolean;
   /** A real engine produced a PDF; the quick preview only produces HTML. */
   isPdf?: boolean;
+  /** Called when a compiler error line is clicked. */
+  onJumpToError?: (fileName: string, line: number) => void;
 }
 
 export const PDFPreview: React.FC<PDFPreviewProps> = ({
   compiledUrl,
   compileLog,
   isCompiling,
-  isPdf = false
+  isPdf = false,
+  onJumpToError
 }) => {
   const [zoom, setZoom] = useState(100);
 
@@ -78,7 +81,34 @@ export const PDFPreview: React.FC<PDFPreviewProps> = ({
           <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '4px', color: '#7b8593' }}>
             <Terminal size={12} /> Compiler Output
           </div>
-          {compileLog}
+          {compileLog.split('\n').map((line, index) => {
+            // -file-line-error makes the engine print "main.tex:37: message",
+            // which is enough to jump straight to the offending line.
+            const hit = line.match(/^([^\s:]+\.(?:tex|sty|cls|bib)):(\d+):\s*(.*)$/);
+            if (!hit || !onJumpToError) return <div key={index}>{line}</div>;
+
+            const [, fileName, lineNumber, message] = hit;
+            return (
+              <div key={index}>
+                <button
+                  onClick={() => onJumpToError(fileName, Number(lineNumber))}
+                  title={`Go to ${fileName} line ${lineNumber}`}
+                  style={{
+                    background: 'none',
+                    border: 'none',
+                    padding: 0,
+                    font: 'inherit',
+                    color: '#c97b7b',
+                    cursor: 'pointer',
+                    textDecoration: 'underline'
+                  }}
+                >
+                  {fileName}:{lineNumber}
+                </button>
+                <span style={{ color: '#ccd2da' }}>: {message}</span>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>

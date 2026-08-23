@@ -180,13 +180,75 @@ fn redact(text: &str, secret: &str) -> String {
         .replace(&percent_encode(secret), "***")
 }
 
+/// Where Git for Windows lands. A freshly installed git is not on the PATH of an
+/// already-running process, and on macOS a Finder-launched app never sees the
+/// shell's PATH at all — so look in the usual places before giving up.
+fn git_search_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    #[cfg(windows)]
+    {
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+            if let Some(base) = std::env::var_os(var) {
+                let root = PathBuf::from(base);
+                dirs.push(root.join("Git").join("cmd"));
+                dirs.push(root.join("Programs").join("Git").join("cmd"));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        for base in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+            dirs.push(PathBuf::from(base));
+        }
+    }
+
+    dirs
+}
+
+/// Cached because run_git is called several times per sync, but invalidatable:
+/// installing git mid-session has to be able to change the answer.
+static GIT_PROGRAM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn resolve_git_program() -> String {
+    if matches!(
+        run_tool("git", &["--version".to_string()], &std::env::temp_dir(), &[]),
+        Ok((0, _))
+    ) {
+        return "git".to_string();
+    }
+    for dir in git_search_dirs() {
+        let candidate = dir.join(engine_file_name("git"));
+        if candidate.is_file() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    "git".to_string()
+}
+
+fn git_program() -> String {
+    let mut cached = GIT_PROGRAM.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(program) = cached.as_ref() {
+        return program.clone();
+    }
+    let resolved = resolve_git_program();
+    *cached = Some(resolved.clone());
+    resolved
+}
+
+/// Called after an install, so the next call looks at the disk again.
+fn forget_git_program() {
+    *GIT_PROGRAM.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Runs git with credential prompting completely disabled.
 ///
 /// This is the difference between a bad token failing in a second with a real
 /// message and Git Credential Manager silently waiting for input that a webview
 /// can never provide.
 fn run_git(args: &[String], cwd: Option<&Path>, secret: &str) -> Result<GitOutcome, String> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(git_program());
     command
         .arg("-c")
         .arg("credential.helper=")
@@ -270,8 +332,12 @@ fn friendly_error(stderr: &str, stdout: &str) -> String {
             .to_string();
     }
     if lower.contains("conflict") || lower.contains("could not apply") {
-        return "Overleaf has changes that clash with your local edits. Resolve them in \
-                Overleaf, then sync again."
+        // Pointing at Overleaf would be misleading: the local commit still
+        // conflicts on the next rebase, so the conflict has to be settled in the
+        // project folder, which is an ordinary git repository.
+        return "Overleaf changed the same lines you did. Nothing was lost — your local \
+                commit is intact and the rebase was undone. Resolve the conflict in the \
+                project folder with git, then sync again."
             .to_string();
     }
 
@@ -334,6 +400,39 @@ fn zl_project_exists(project_id: String) -> Result<bool, String> {
     Ok(project_dir(&project_id)?.join(".git").is_dir())
 }
 
+/// Keeps compiler byproducts out of the user's Overleaf project.
+///
+/// `-output-directory` redirects most of them, but epstopdf ignores it and
+/// writes `<figure>-eps-converted-to.pdf` next to the source. Those would be
+/// committed and pushed on the next sync. `.git/info/exclude` is the right
+/// place for this: it is local-only and never travels to Overleaf, unlike a
+/// .gitignore, which would show up in the user's project.
+fn write_local_excludes(dir: &Path) {
+    let info = dir.join(".git").join("info");
+    if fs::create_dir_all(&info).is_err() {
+        return;
+    }
+
+    let path = info.join("exclude");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    if existing.contains("eps-converted-to") {
+        return;
+    }
+
+    let rules = [
+        "",
+        "# Added by ZabbLeaf: LaTeX byproducts that must not reach Overleaf.",
+        "*-eps-converted-to.pdf",
+        "*.synctex.gz",
+        "*.fls",
+        "*.fdb_latexmk",
+        "",
+    ]
+    .join("\n");
+
+    let _ = fs::write(&path, format!("{}{}", existing, rules));
+}
+
 #[tauri::command]
 fn zl_clone_project(
     project_id: String,
@@ -382,6 +481,7 @@ fn zl_clone_project(
             Some(&dir),
             &token,
         );
+        write_local_excludes(&dir);
         return Ok(GitOutcome::ok("Project downloaded from Overleaf."));
     }
 
@@ -410,6 +510,9 @@ fn zl_sync_project(
                 .to_string(),
         );
     }
+
+    // Applied here too, so projects cloned before this existed are covered.
+    write_local_excludes(&dir);
 
     let clean = clean_url(&git_url)?;
     let authenticated = auth_url(&git_url, &token)?;
@@ -516,6 +619,50 @@ fn zl_sync_project(
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectChanges {
+    /// Porcelain status lines, one per changed file.
+    files: Vec<String>,
+    /// Unified diff, so the user can see what a sync would publish.
+    diff: String,
+}
+
+/// Shows what a sync would push, before it pushes it.
+#[tauri::command]
+fn zl_project_changes(project_id: String) -> Result<ProjectChanges, String> {
+    let dir = project_dir(&project_id)?;
+    if !dir.join(".git").is_dir() {
+        return Err("This project is not linked to an Overleaf project.".to_string());
+    }
+
+    // Intent-to-add records new files without staging their content, which is
+    // what makes them appear in the diff below.
+    let _ = run_git(
+        &["add".to_string(), "-A".to_string(), "-N".to_string()],
+        Some(&dir),
+        "",
+    );
+
+    let status = run_git(
+        &["status".to_string(), "--porcelain".to_string()],
+        Some(&dir),
+        "",
+    )?;
+    let diff = run_git(&["diff".to_string(), "HEAD".to_string()], Some(&dir), "")?;
+
+    Ok(ProjectChanges {
+        files: status
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+        diff: diff.stdout,
+    })
+}
+
 #[tauri::command]
 fn zl_read_project_files(project_id: String) -> Result<Vec<ProjectFile>, String> {
     let dir = project_dir(&project_id)?;
@@ -604,6 +751,21 @@ fn zl_write_project_file(
             .map_err(|e| format!("Cannot create {}: {}", parent.display(), e))?;
     }
     fs::write(&target, content).map_err(|e| format!("Cannot write {}: {}", target.display(), e))
+}
+
+/// Removes one file from the project.
+///
+/// Without this, deleting a file only dropped it from the list: `git add -A`
+/// saw no removal, and the file came back the next time the project was opened.
+#[tauri::command]
+fn zl_delete_project_file(project_id: String, rel_path: String) -> Result<(), String> {
+    let dir = project_dir(&project_id)?;
+    let target = safe_join(&dir, &rel_path)?;
+    if target.is_file() {
+        fs::remove_file(&target)
+            .map_err(|e| format!("Cannot delete {}: {}", target.display(), e))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -832,6 +994,10 @@ fn zl_compile_project(
         return Err(format!("{} does not exist in this project.", main_file));
     }
 
+    // epstopdf will drop converted figures next to the sources, so make sure
+    // they are ignored before they exist.
+    write_local_excludes(&project);
+
     let out_dir = build_dir(&project_id)?;
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Cannot create {}: {}", out_dir.display(), e))?;
@@ -917,6 +1083,101 @@ fn zl_compile_project(
         message,
         log,
         pdf_base64: None,
+    })
+}
+
+/// Installs git, which unlike a TeX engine is not optional: without it ZabbLeaf
+/// cannot reach Overleaf at all.
+#[tauri::command]
+fn zl_install_git() -> Result<InstallOutcome, String> {
+    if matches!(
+        run_tool(&git_program(), &["--version".to_string()], &std::env::temp_dir(), &[]),
+        Ok((0, _))
+    ) {
+        return Ok(InstallOutcome {
+            success: true,
+            message: "git is already installed.".to_string(),
+            log: String::new(),
+        });
+    }
+    install_git_for_platform()
+}
+
+#[cfg(windows)]
+fn install_git_for_platform() -> Result<InstallOutcome, String> {
+    // Git for Windows has no per-user installer (`winget show --scope user`
+    // reports no applicable installer), so this needs elevation. That means
+    // --disable-interactivity must NOT be passed: it would suppress the UAC
+    // prompt and the install would simply fail.
+    let args = [
+        "install".to_string(),
+        "--id".to_string(),
+        "Git.Git".to_string(),
+        "--silent".to_string(),
+        "--accept-package-agreements".to_string(),
+        "--accept-source-agreements".to_string(),
+    ];
+
+    let (_, log) = run_tool("winget", &args, &std::env::temp_dir(), &[]).map_err(|e| {
+        format!(
+            "{}
+
+Install Git manually from https://git-scm.com/download/win",
+            e
+        )
+    })?;
+
+    // A fresh install is not on this process's PATH, so look at the disk again.
+    forget_git_program();
+    if matches!(
+        run_tool(&git_program(), &["--version".to_string()], &std::env::temp_dir(), &[]),
+        Ok((0, _))
+    ) {
+        return Ok(InstallOutcome {
+            success: true,
+            message: "git installed. ZabbLeaf can reach Overleaf now.".to_string(),
+            log,
+        });
+    }
+
+    Ok(InstallOutcome {
+        success: false,
+        message: "Could not install git automatically — it needs administrator permission.                   Install it from https://git-scm.com/download/win and restart ZabbLeaf."
+            .to_string(),
+        log,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn install_git_for_platform() -> Result<InstallOutcome, String> {
+    // Triggers Apple's own command line tools installer, which is a GUI prompt.
+    let (_, out) = run_tool(
+        "xcode-select",
+        &["--install".to_string()],
+        &std::env::temp_dir(),
+        &[],
+    )
+    .map_err(|_| {
+        "Could not start the installer. Run 'xcode-select --install' in Terminal.".to_string()
+    })?;
+
+    Ok(InstallOutcome {
+        success: true,
+        message: "macOS is installing the command line tools, which include git. Restart ZabbLeaf when it finishes."
+            .to_string(),
+        log: out,
+    })
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn install_git_for_platform() -> Result<InstallOutcome, String> {
+    Ok(InstallOutcome {
+        success: false,
+        message: "Install git with your package manager, then restart ZabbLeaf.".to_string(),
+        log: "Debian/Ubuntu:  sudo apt install git\n\
+              Fedora:         sudo dnf install git\n\
+              Arch:           sudo pacman -S git"
+            .to_string(),
     })
 }
 
@@ -1251,8 +1512,11 @@ fn main() {
             zl_clone_project,
             zl_sync_project,
             zl_read_project_files,
+            zl_project_changes,
             zl_write_project_file,
             zl_delete_project,
+            zl_delete_project_file,
+            zl_install_git,
             zl_detect_engines,
             zl_compile_project,
             zl_install_tex
