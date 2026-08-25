@@ -2,8 +2,6 @@
 
 ZabbLeaf is a standalone desktop application for editing LaTeX offline and synchronizing with Overleaf.
 
-Developed by Diletta Abbonato (Zabbonat).
-
 ![The editor with a locally compiled PDF](docs/screenshots/editor-and-pdf.png)
 
 Your Overleaf project, cloned to your machine, edited in a real editor, and compiled to PDF by a TeX engine running on your own computer.
