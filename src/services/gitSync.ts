@@ -15,6 +15,36 @@ export interface SyncResult {
   message: string;
 }
 
+/**
+ * Reading the project's text files.
+ *
+ * `success` matters as much as `files`: an empty list used to mean both "this
+ * project is empty" and "the read failed", and the caller that could not tell
+ * them apart wrote a blank starter document over a project it had merely
+ * failed to read.
+ */
+export interface ReadFilesResult {
+  success: boolean;
+  files: ProjectFile[];
+  message: string;
+}
+
+/** What a sync would publish, plus whether git could be asked at all. */
+export interface ChangesResult {
+  success: boolean;
+  files: string[];
+  diff: string;
+  message: string;
+}
+
+/** A file that is only written when nothing is there yet. */
+export interface WriteNewResult {
+  success: boolean;
+  /** False when something already occupied that path; nothing was touched. */
+  written: boolean;
+  message: string;
+}
+
 interface GitOutcome {
   success: boolean;
   message: string;
@@ -187,42 +217,79 @@ export class GitSyncService {
     }
   }
 
-  /** What a sync would publish: the changed files and a unified diff. */
-  async getChanges(projectId: string): Promise<{ files: string[]; diff: string }> {
+  /**
+   * What a sync would publish: the changed files and a unified diff.
+   *
+   * A failure here used to come back as an empty list, which the sync path read
+   * as "nothing to review" and pushed without ever showing the diff.
+   */
+  async getChanges(projectId: string): Promise<ChangesResult> {
     try {
-      return await invoke<{ files: string[]; diff: string }>('zl_project_changes', { projectId });
-    } catch (err) {
+      const changes = await invoke<{ files: string[]; diff: string }>('zl_project_changes', { projectId });
+      return { success: true, files: changes.files, diff: changes.diff, message: '' };
+    } catch (err: any) {
       console.error('[GitSync] Could not read changes:', err);
-      return { files: [], diff: '' };
+      return { success: false, files: [], diff: '', message: String(err?.message || err) };
     }
   }
 
   /** Reads every text file in the project, recursively. */
-  async readProjectFiles(projectId: string): Promise<ProjectFile[]> {
+  async readProjectFiles(projectId: string): Promise<ReadFilesResult> {
     try {
       const files = await invoke<ProjectFile[]>('zl_read_project_files', { projectId });
       console.log(`[GitSync] Read ${files.length} files for ${projectId}`);
-      return files;
-    } catch (err) {
+      return { success: true, files, message: '' };
+    } catch (err: any) {
       console.error('[GitSync] readProjectFiles failed:', err);
-      return [];
+      return { success: false, files: [], message: String(err?.message || err) };
     }
   }
 
-  async writeFile(projectId: string, fileName: string, content: string): Promise<void> {
+  /**
+   * Writes one file through to disk.
+   *
+   * Reports failure rather than logging it: a disk-full or permission error
+   * reached only a console nobody can see, so the user kept typing into a
+   * document that had stopped being saved.
+   */
+  async writeFile(projectId: string, fileName: string, content: string): Promise<SyncResult> {
     try {
       await invoke('zl_write_project_file', { projectId, relPath: fileName, content });
-    } catch (err) {
+      return { success: true, message: '' };
+    } catch (err: any) {
       console.error(`[GitSync] Could not write ${fileName}:`, err);
+      return { success: false, message: String(err?.message || err) };
+    }
+  }
+
+  /**
+   * Writes a file only if nothing is there yet.
+   *
+   * Used for the starter document of a new project: the plain write would
+   * happily overwrite a real document that a failed read had made look absent.
+   */
+  async writeNewFile(projectId: string, fileName: string, content: string): Promise<WriteNewResult> {
+    try {
+      const written = await invoke<boolean>('zl_write_new_project_file', {
+        projectId,
+        relPath: fileName,
+        content
+      });
+      return { success: true, written, message: '' };
+    } catch (err: any) {
+      console.error(`[GitSync] Could not create ${fileName}:`, err);
+      return { success: false, written: false, message: String(err?.message || err) };
     }
   }
 
   /** Removes one file from disk, so git sees the deletion on the next sync. */
-  async deleteFile(projectId: string, fileName: string): Promise<void> {
+  async deleteFile(projectId: string, fileName: string): Promise<SyncResult> {
     try {
       await invoke('zl_delete_project_file', { projectId, relPath: fileName });
-    } catch (err) {
+      return { success: true, message: '' };
+    } catch (err: any) {
       console.error(`[GitSync] Could not delete ${fileName}:`, err);
+      return { success: false, message: String(err?.message || err) };
     }
   }
 

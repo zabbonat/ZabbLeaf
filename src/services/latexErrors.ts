@@ -25,8 +25,13 @@ export interface Diagnostic {
 /**
  * Commands that only exist once a package is loaded. This is the lookup that
  * turns "Undefined control sequence" into "add \usepackage{booktabs}".
+ *
+ * Exported because the completion catalogue builds \usepackage{ suggestions out
+ * of it: a second hand-written package list would drift from the one the
+ * one-click installer reads, and then the installer button would offer to
+ * install something the editor never suggested.
  */
-const COMMAND_PACKAGES: Record<string, string> = {
+export const COMMAND_PACKAGES: Record<string, string> = {
   toprule: 'booktabs',
   midrule: 'booktabs',
   bottomrule: 'booktabs',
@@ -72,8 +77,8 @@ const COMMAND_PACKAGES: Record<string, string> = {
   hl: 'soul'
 };
 
-/** Environments that need a package, same idea. */
-const ENVIRONMENT_PACKAGES: Record<string, string> = {
+/** Environments that need a package, same idea — and exported for the same reason. */
+export const ENVIRONMENT_PACKAGES: Record<string, string> = {
   align: 'amsmath',
   'align*': 'amsmath',
   gather: 'amsmath',

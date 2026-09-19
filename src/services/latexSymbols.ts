@@ -10,11 +10,44 @@ export interface ProjectSymbol {
   key: string;
   /** Shown next to the key in the suggestion list. */
   detail: string;
+  /**
+   * Markdown for the suggestion widget's details pane. Filled here rather than
+   * from a resolveCompletionItem callback because the completion provider runs
+   * on the keystroke path and must not go back to the files.
+   */
+  documentation?: string;
+}
+
+/** Everything a .bib entry is worth showing, pulled from one window of text. */
+function describeEntry(kind: string, body: string): { detail: string; documentation?: string } {
+  // The leading boundary is load-bearing: without it the `title` probe matched
+  // inside `booktitle`, so an @inproceedings entry that lists the venue first
+  // showed "Proceedings of NeurIPS" as its title and never showed the paper's.
+  // A lookbehind would be shorter, but the webviews this ships in are not all
+  // new enough for one.
+  const field = (names: string, limit: number) =>
+    body
+      .match(new RegExp(`(?:^|[^A-Za-z])(?:${names})\\s*=\\s*[{"]+([^}"]{3,${limit}})`, 'i'))?.[1]
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const title = field('title', 80);
+  const author = field('author', 120);
+  const journal = field('journal|booktitle|publisher|school|institution', 80);
+  const year = body.match(/year\s*=\s*[{"]?\s*(\d{4})/i)?.[1];
+
+  const byline = [author, year].filter(Boolean).join(' · ');
+  const lines = [title ? `**${title}**` : `**${kind}**`, byline, journal ? `*${journal}*` : ''];
+
+  return {
+    detail: title ? `${kind}: ${title}` : kind,
+    documentation: lines.filter(Boolean).join('\n\n') || undefined
+  };
 }
 
 /** Reads @article{key, ... entries. Comment-only lines are skipped. */
 export function collectCitations(files: { name: string; content: string }[]): ProjectSymbol[] {
-  const found = new Map<string, string>();
+  const found = new Map<string, ProjectSymbol>();
 
   for (const file of files) {
     if (!file.name.toLowerCase().endsWith('.bib')) continue;
@@ -27,12 +60,11 @@ export function collectCitations(files: { name: string; content: string }[]): Pr
 
       // The title makes the list readable when keys are opaque.
       const after = file.content.slice(match.index, match.index + 800);
-      const title = after.match(/title\s*=\s*[{"]+([^}"]{3,80})/i)?.[1];
-      found.set(key, title ? `${kind}: ${title.replace(/\s+/g, ' ').trim()}` : kind);
+      found.set(key, { key, ...describeEntry(kind, after) });
     }
   }
 
-  return [...found].map(([key, detail]) => ({ key, detail }));
+  return [...found.values()];
 }
 
 /** Reads \label{...} from every source, so \ref{ can offer them. */
@@ -40,7 +72,9 @@ export function collectLabels(files: { name: string; content: string }[]): Proje
   const found = new Map<string, string>();
 
   for (const file of files) {
-    if (!file.name.toLowerCase().endsWith('.tex')) continue;
+    // Everything except the bibliography: labels live in .sty, .cls and .ltx
+    // fragments too, and a \ref to one of those used to be reported as unknown.
+    if (file.name.toLowerCase().endsWith('.bib')) continue;
 
     const label = /\\label\{([^}]+)\}/g;
     let match: RegExpExecArray | null;
@@ -53,103 +87,7 @@ export function collectLabels(files: { name: string; content: string }[]): Proje
 }
 
 /**
- * True when the caret sits inside the braces of one of the given commands, which
- * is the only place these suggestions belong.
- */
-export function isInsideCommand(textBeforeCaret: string, commands: string[]): boolean {
-  const open = textBeforeCaret.lastIndexOf('{');
-  if (open === -1) return false;
-  // A closing brace after the last opening one means we are already out.
-  if (textBeforeCaret.indexOf('}', open) !== -1) return false;
-
-  const head = textBeforeCaret.slice(0, open);
-  return commands.some(command => new RegExp(`\\\\${command}\\*?(\\[[^\\]]*\\])?$`).test(head));
-}
-
-/** Ready-made blocks for the things nobody remembers the syntax of. */
-export interface LatexSnippet {
-  label: string;
-  detail: string;
-  /** Monaco snippet syntax: ${1:placeholder} marks the tab stops. */
-  body: string;
-}
-
-export const LATEX_SNIPPETS: LatexSnippet[] = [
-  {
-    label: 'figure',
-    detail: 'Figure with caption and label',
-    body: [
-      '\\begin{figure}[${1:htbp}]',
-      '  \\centering',
-      '  \\includegraphics[width=${2:0.8}\\textwidth]{${3:path/to/image}}',
-      '  \\caption{${4:Caption}}',
-      '  \\label{fig:${5:key}}',
-      '\\end{figure}'
-    ].join('\\n')
-  },
-  {
-    label: 'table',
-    detail: 'Table with booktabs rules',
-    body: [
-      '\\begin{table}[${1:htbp}]',
-      '  \\centering',
-      '  \\caption{${2:Caption}}',
-      '  \\label{tab:${3:key}}',
-      '  \\begin{tabular}{${4:lcc}}',
-      '    \\toprule',
-      '    ${5:Column} & ${6:Column} & ${7:Column} \\\\',
-      '    \\midrule',
-      '    ${8:value} & value & value \\\\',
-      '    \\bottomrule',
-      '  \\end{tabular}',
-      '\\end{table}'
-    ].join('\\n')
-  },
-  {
-    label: 'equation',
-    detail: 'Numbered equation with label',
-    body: [
-      '\\begin{equation}',
-      '  ${1:x = y}',
-      '  \\label{eq:${2:key}}',
-      '\\end{equation}'
-    ].join('\\n')
-  },
-  {
-    label: 'itemize',
-    detail: 'Bulleted list',
-    body: [
-      '\\begin{itemize}',
-      '  \\item ${1:first}',
-      '  \\item ${2:second}',
-      '\\end{itemize}'
-    ].join('\\n')
-  },
-  {
-    label: 'subfigure',
-    detail: 'Two figures side by side',
-    body: [
-      '\\begin{figure}[${1:htbp}]',
-      '  \\centering',
-      '  \\begin{subfigure}{0.48\\textwidth}',
-      '    \\includegraphics[width=\\textwidth]{${2:left}}',
-      '    \\caption{${3:Left}}',
-      '  \\end{subfigure}',
-      '  \\hfill',
-      '  \\begin{subfigure}{0.48\\textwidth}',
-      '    \\includegraphics[width=\\textwidth]{${4:right}}',
-      '    \\caption{${5:Right}}',
-      '  \\end{subfigure}',
-      '  \\caption{${6:Overall caption}}',
-      '  \\label{fig:${7:key}}',
-      '\\end{figure}'
-    ].join('\\n')
-  }
-];
-
-/**
- * Finds \cite and 
-ef keys used in a document that do not exist, which
+ * Finds \cite and \ref keys used in a document that do not exist, which
  * otherwise only show up as [?] in the compiled PDF.
  */
 export interface UnknownReference {

@@ -33,6 +33,10 @@
       },
       "path": {
         "all": true
+      },
+      "window": {
+        "all": false,
+        "close": true
       }
     },
     "bundle": {

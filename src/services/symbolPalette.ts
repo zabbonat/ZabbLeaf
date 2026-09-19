@@ -210,11 +210,21 @@ export function searchSymbols(query: string): SymbolGroup[] {
  * and letting the user find out from a compile error.
  */
 export function isInsideMath(textBeforeCaret: string): boolean {
-  const environment = /\\(begin|end)\{(equation|align|gather|multline|math|displaymath)\*?\}/g;
+  // \[ ... \] used to read as text mode, so a symbol accepted inside a display
+  // block was wrapped in $...$ and the document stopped compiling.
+  const delimiter =
+    /\\(begin|end)\{(equation|align|gather|multline|math|displaymath)\*?\}|\\([[\]()])/g;
   let open = false;
   let match: RegExpExecArray | null;
-  while ((match = environment.exec(textBeforeCaret)) !== null) {
-    open = match[1] === 'begin';
+  while ((match = delimiter.exec(textBeforeCaret)) !== null) {
+    if (match[1]) {
+      open = match[1] === 'begin';
+      continue;
+    }
+    // `\\[2ex]` is a line break with extra leading, not the start of display
+    // maths, and it is common inside align and tabular.
+    if (textBeforeCaret[match.index - 1] === '\\') continue;
+    open = match[3] === '[' || match[3] === '(';
   }
   if (open) return true;
 

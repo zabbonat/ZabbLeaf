@@ -39,7 +39,9 @@ The version lives in three places that must be bumped together: `package.json`, 
 
 ### Split of responsibilities
 
-**Everything that touches git or the disk is in Rust** — one file, `src-tauri/src/main.rs`, exposing `zl_*` Tauri commands. The webview never shells out and never uses the Tauri `fs` API. (The `isomorphic-git`, `lightning-fs`, `fake-indexeddb` and `pdfjs-dist` dependencies are leftovers from an earlier in-webview approach and are not imported anywhere; don't build on them.)
+**Everything that touches git or the disk is in Rust** — one file, `src-tauri/src/main.rs`, exposing `zl_*` Tauri commands. The webview never shells out and never uses the Tauri `fs` API. (The `isomorphic-git`, `lightning-fs` and `fake-indexeddb` dependencies are leftovers from an earlier in-webview approach and are not imported anywhere; don't build on them.)
+
+**`pdfjs-dist` is not one of those leftovers — do not delete it.** `services/pdfEngine.ts` and `components/PDFViewer/PdfCanvasView.tsx` import it to rasterize the compiled PDF onto a canvas at the device pixel ratio; removing the dependency blanks the PDF pane. The iframe path in `PDFPreview` now only serves `html-preview`. `pdfEngine.ts` constructs the worker itself and hands pdf.js a `workerPort` rather than a `workerSrc`, because pdf.js's same-origin check misreads `tauri://localhost` (whose `URL.origin` serializes to `"null"`) and would route through an `importScripts` blob wry 0.24 does not allow; an 8 s watchdog falls back to a main-thread worker. `src/vite-env.d.ts` exists so `tsc` can resolve that `?url` worker import. `npm run build` emits `dist/assets/pdf.worker.min-<hash>.js` — without it the pane hangs for 8 s and then parses on the main thread.
 
 `src/services/*.ts` are singletons. The ones that talk to the backend (`gitSync`, `localTeXCompiler`, `projectAssets`) are thin `invoke` wrappers that catch errors and return `{ success, message }`-style results rather than throwing. The rest (`textStats`, `todoScanner`, `latexErrors`, `latexSymbols`, `symbolPalette`, `writingStats`, `projectTemplates`) are pure functions over the in-memory file list.
 

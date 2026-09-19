@@ -1,11 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Editor, { Monaco } from '@monaco-editor/react';
+import type { languages, Position, editor as monacoEditor } from 'monaco-editor';
+import { ProjectSymbol, findUnknownReferences } from '../../services/latexSymbols';
 import {
-  ProjectSymbol,
-  isInsideCommand,
-  findUnknownReferences,
-  LATEX_SNIPPETS
-} from '../../services/latexSymbols';
+  CompletionItemKindKey,
+  EMPTY_COMPLETION_SOURCES,
+  LatexCompletion,
+  ProjectCompletionSources,
+  completionsAt,
+  mathWindow
+} from '../../services/latexCompletions';
 import { isInsideMath } from '../../services/symbolPalette';
 import { WordCount, countWords } from '../../services/textStats';
 import { EditorStatusBar } from './EditorStatusBar';
@@ -21,10 +25,19 @@ interface LaTeXEditorProps {
   content: string;
   onChange: (value: string | undefined) => void;
   fileName: string;
+  /**
+   * URI for this file's Monaco model. Every file used to share one model and
+   * therefore one undo stack, so Ctrl+Z after switching files replaced the
+   * current file's buffer with the previous file's text — which was then saved
+   * and pushed to Overleaf. Must be unique per project *and* per file.
+   */
+  modelPath: string;
   /** Citation keys from the project's .bib files. */
   citations?: ProjectSymbol[];
   /** \label targets from the project's sources. */
   labels?: ProjectSymbol[];
+  /** Environments, file names, figures and packages this project already has. */
+  sources?: ProjectCompletionSources;
   /** Set to jump the caret somewhere, e.g. from a compiler error. */
   revealLine?: { line: number; nonce: number } | null;
   /** Set to type something in at the caret, e.g. a symbol or a figure block. */
@@ -70,6 +83,10 @@ const registerLatexLanguage = (monaco: Monaco) => {
     }
   });
 
+  // No `wordPattern` override on purpose: Monaco filters a suggestion against
+  // the text from that item's own range.startColumn, not against the word
+  // pattern, so widening it would buy nothing and would silently change
+  // double-click selection and Ctrl+arrow motion everywhere.
   monaco.languages.setLanguageConfiguration('latex', {
     comments: { lineComment: '%' },
     brackets: [
@@ -90,12 +107,77 @@ const registerLatexLanguage = (monaco: Monaco) => {
   });
 };
 
+/**
+ * Hoisted out of the JSX because `@monaco-editor/react` re-runs
+ * `editor.updateOptions(options)` whenever the object's identity changes — an
+ * inline literal meant every keystroke reconfigured the whole editor.
+ *
+ * Annotated rather than `as const`: the options interface has readonly-array
+ * fields, and a frozen literal stops assigning to them the moment one is used.
+ */
+const EDITOR_OPTIONS: monacoEditor.IStandaloneEditorConstructionOptions = {
+  fontSize: 14,
+  fontFamily: "'Fira Code', monospace",
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  wordWrap: 'on',
+  lineNumbers: 'on',
+  automaticLayout: true,
+  tabSize: 2,
+
+  // Tab did nothing but indent because `tabCompletion` sat at its 'off'
+  // default, which leaves Monaco's `insertBestCompletion` command permanently
+  // unbound. Turning it on is the whole fix — and it is only safe alongside
+  // the three things below, because Tab now runs a suggest round trip at the
+  // end of every word:
+  //   * `wordBasedSuggestions: 'off'` and `suggest.showWords: false` stop the
+  //     scraped-document-words noise that made the old list useless;
+  //   * the provider returns nothing at all in prose, so Tab there falls
+  //     through to the `tab` command and still indents;
+  //   * every item carries an explicit range, without which Tab would insert
+  //     a second backslash on top of the one already typed.
+  // No custom Tab keybinding is registered: Monaco already binds Tab three
+  // ways, gated on the context keys `suggestWidgetVisible` (accept the
+  // selected suggestion), `inSnippetMode` (jump to the next tab stop) and
+  // neither (`insertBestCompletion`, which declares `fallback: 'tab'` so plain
+  // indentation survives). A keybinding added here would outrank all three and
+  // would have to reimplement them.
+  tabCompletion: 'on',
+  // Kept explicit: the backslash trigger character below depends on it.
+  suggestOnTriggerCharacters: true,
+  suggestSelection: 'first',
+  snippetSuggestions: 'inline',
+  wordBasedSuggestions: 'off',
+  // `strings: 'on'` is load-bearing: the Monarch grammar above tokenises
+  // `$...$` as `string`, and the default is 'off', so nothing ever opened
+  // inside maths — where a symbol list is most wanted.
+  quickSuggestions: { other: 'on', comments: 'off', strings: 'on' },
+  suggest: {
+    // Tab is bound to accept-suggestion at a higher weight than
+    // jump-to-next-placeholder, so a widget opened by quick suggestions inside
+    // a snippet placeholder steals Tab from the tab stops. The few items that
+    // land the caret in a brace worth completing ask for the list back
+    // explicitly instead — see `command` in `toSuggestion`.
+    snippetsPreventQuickSuggestions: true,
+    // The default 'insert' ignores the replace half of each item's range, so
+    // completing in the middle of `\begin{fig|ure}` would double the word.
+    insertMode: 'replace',
+    // Lets `\alph` reach `\alpha` through a synonym folded into filterText.
+    matchOnWordStartOnly: false,
+    filterGraceful: true,
+    selectionMode: 'always',
+    showWords: false
+  }
+};
+
 export const LaTeXEditor: React.FC<LaTeXEditorProps> = ({
   content,
   onChange,
   fileName,
+  modelPath,
   citations = [],
   labels = [],
+  sources = EMPTY_COMPLETION_SOURCES,
   revealLine = null,
   insertion = null,
   onPasteImage,
@@ -104,8 +186,8 @@ export const LaTeXEditor: React.FC<LaTeXEditorProps> = ({
 }) => {
   // The completion provider is registered once, but the lists change as files
   // are edited, so it reads them through a ref rather than closing over a copy.
-  const symbols = useRef({ citations, labels });
-  symbols.current = { citations, labels };
+  const sourcesRef = useRef({ citations, labels, sources });
+  sourcesRef.current = { citations, labels, sources };
 
   const registration = useRef<{ dispose: () => void } | null>(null);
   const editorRef = useRef<any>(null);
@@ -132,6 +214,10 @@ export const LaTeXEditor: React.FC<LaTeXEditorProps> = ({
 
   // Underline citation and reference keys that do not exist, which otherwise only
   // surface as [?] in the compiled PDF.
+  //
+  // `modelPath` is in the dependency list because each file now has its own
+  // model: switching to a file whose text happens to be identical changes
+  // nothing else here, and the new model would be left with no markers at all.
   useEffect(() => {
     const editor = editorRef.current;
     const monaco = monacoRef.current;
@@ -153,7 +239,7 @@ export const LaTeXEditor: React.FC<LaTeXEditorProps> = ({
     }));
 
     monaco.editor.setModelMarkers(model, 'zabbleaf', markers);
-  }, [content, citations, labels]);
+  }, [content, citations, labels, modelPath]);
 
   // Jump to a line, used when a compiler error is clicked.
   useEffect(() => {
@@ -257,56 +343,118 @@ export const LaTeXEditor: React.FC<LaTeXEditorProps> = ({
       pasteHandler.current = listener;
     }
 
-    registration.current = monaco.languages.registerCompletionItemProvider('latex', {
-      triggerCharacters: ['{', ','],
-      provideCompletionItems: (model: any, position: any) => {
-        const before = model.getValueInRange({
+    // Never `Text`: `suggest.showWords: false` filters that kind straight out
+    // of the list, so an item given it would be built and then thrown away.
+    const kinds = monaco.languages.CompletionItemKind;
+    const KIND_MAP: Record<CompletionItemKindKey, languages.CompletionItemKind> = {
+      command: kinds.Function,
+      symbol: kinds.Operator,
+      environment: kinds.Class,
+      snippet: kinds.Snippet,
+      citation: kinds.Reference,
+      label: kinds.Variable,
+      package: kinds.Module,
+      file: kinds.File
+    };
+    const rules = monaco.languages.CompletionItemInsertTextRule;
+
+    const toSuggestion = (
+      item: LatexCompletion,
+      position: Position
+    ): languages.CompletionItem => ({
+      label: item.label,
+      kind: KIND_MAP[item.kindKey],
+      detail: item.detail,
+      documentation: item.documentation ? { value: item.documentation } : undefined,
+      insertText: item.insertText,
+      // Only the bodies that carry tab stops go through the snippet parser; a
+      // citation key or a bare \alpha is literal text and would lose its
+      // backslash to it.
+      insertTextRules: item.isSnippet ? rules.InsertAsSnippet : rules.None,
+      filterText: item.filterText,
+      sortText: item.sortText,
+      commitCharacters: item.commitCharacters,
+      preselect: item.preselect,
+      // Accepting `\cite` leaves the caret inside a live snippet placeholder,
+      // where `snippetsPreventQuickSuggestions` below blocks quick suggestions
+      // outright — so typing the first letters of a key opened nothing at all,
+      // on the one interaction this feature is advertised on. Monaco special-
+      // cases this command id and re-triggers the widget itself after the
+      // insert (`SuggestController._insertSuggestion`), which is the only path
+      // into the list that the snippet session does not close off. Once it is
+      // open, further typing refilters rather than re-triggering, so the rest
+      // of the key narrows the list normally.
+      command: item.retrigger
+        ? { id: 'editor.action.triggerSuggest', title: 'Suggest' }
+        : undefined,
+      // Monaco's own `getWordUntilPosition` stops at `\`, `:`, `-` and `.`, so
+      // the default range excludes the backslash the user just typed: the list
+      // filtered itself to nothing, and accepting inside `\cite{knuth:19`
+      // wrote `\cite{knuth:knuth:1984`. Both ranges must be single-line, on the
+      // request's line, and share a startColumn or Monaco discards the item.
+      range: {
+        insert: {
           startLineNumber: position.lineNumber,
-          startColumn: 1,
+          startColumn: item.startColumn,
           endLineNumber: position.lineNumber,
-          endColumn: position.column
+          endColumn: item.insertEndColumn
+        },
+        replace: {
+          startLineNumber: position.lineNumber,
+          startColumn: item.startColumn,
+          endLineNumber: position.lineNumber,
+          endColumn: item.replaceEndColumn
+        }
+      }
+    });
+
+    registration.current = monaco.languages.registerCompletionItemProvider('latex', {
+      // '\\' is ONE backslash at runtime. Monaco compares each trigger against
+      // a single typed character, so a two-character string here would never
+      // fire — and the backslash is the trigger this whole feature turns on.
+      // '/' reopens the widget part-way through `\input{chapters/`, and ',' is
+      // safe because the provider returns nothing outside a comma list.
+      triggerCharacters: ['\\', '{', ',', '/'],
+      // Annotated rather than inferred: `@monaco-editor/react` types `Monaco`
+      // through a deep `monaco-editor/esm/...` import that its `exports` map no
+      // longer resolves, so the whole namespace lands here as `any`.
+      provideCompletionItems: (model: monacoEditor.ITextModel, position: Position) => {
+        const line = model.getLineContent(position.lineNumber);
+        const live = sourcesRef.current;
+
+        const items = completionsAt({
+          lineBefore: line.slice(0, position.column - 1),
+          lineAfter: line.slice(position.column - 1),
+          mathBefore: mathWindow(
+            lineNumber => model.getLineContent(lineNumber),
+            position.lineNumber,
+            position.column
+          ),
+          // Left as closures: only a caret inside `\begin{`/`\end{` needs the
+          // rest of the document, and building either on every prose keystroke
+          // would copy the whole chapter.
+          documentBefore: () =>
+            model.getValueInRange({
+              startLineNumber: 1,
+              startColumn: 1,
+              endLineNumber: position.lineNumber,
+              endColumn: position.column
+            }),
+          documentAfter: () =>
+            model.getValueInRange({
+              startLineNumber: position.lineNumber,
+              startColumn: position.column,
+              endLineNumber: model.getLineCount(),
+              endColumn: model.getLineMaxColumn(model.getLineCount())
+            }),
+          lineNumber: position.lineNumber,
+          column: position.column,
+          citations: live.citations,
+          labels: live.labels,
+          sources: live.sources
         });
 
-        const wanted = isInsideCommand(before, ['cite', 'citep', 'citet', 'parencite', 'textcite', 'autocite'])
-          ? symbols.current.citations
-          : isInsideCommand(before, ['ref', 'eqref', 'autoref', 'cref', 'Cref', 'pageref'])
-            ? symbols.current.labels
-            : null;
-
-        const word = model.getWordUntilPosition(position);
-        const here = {
-          startLineNumber: position.lineNumber,
-          endLineNumber: position.lineNumber,
-          startColumn: word.startColumn,
-          endColumn: word.endColumn
-        };
-
-        // Outside a citation or reference, offer the blocks nobody remembers
-        // the syntax of.
-        if (!wanted) {
-          return {
-            suggestions: LATEX_SNIPPETS.map(snippet => ({
-              label: snippet.label,
-              kind: monaco.languages.CompletionItemKind.Snippet,
-              detail: snippet.detail,
-              insertText: snippet.body,
-              insertTextRules: monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
-              range: here
-            }))
-          };
-        }
-
-        if (wanted.length === 0) return { suggestions: [] };
-
-        return {
-          suggestions: wanted.map(symbol => ({
-            label: symbol.key,
-            kind: monaco.languages.CompletionItemKind.Reference,
-            detail: symbol.detail,
-            insertText: symbol.key,
-            range: here
-          }))
-        };
+        return { suggestions: items.map(item => toSuggestion(item, position)) };
       }
     });
   };
@@ -320,22 +468,14 @@ export const LaTeXEditor: React.FC<LaTeXEditorProps> = ({
       <div style={{ flex: 1, minHeight: 0 }}>
         <Editor
           height="100%"
+          path={modelPath}
           defaultLanguage="latex"
           theme="vs-dark"
           value={content}
           onChange={onChange}
           beforeMount={registerLatexLanguage}
           onMount={handleMount}
-          options={{
-            fontSize: 14,
-            fontFamily: "'Fira Code', monospace",
-            minimap: { enabled: false },
-            scrollBeyondLastLine: false,
-            wordWrap: 'on',
-            lineNumbers: 'on',
-            automaticLayout: true,
-            tabSize: 2
-          }}
+          options={EDITOR_OPTIONS}
         />
       </div>
 

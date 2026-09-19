@@ -270,14 +270,170 @@ body {
   flex-direction: column;
 }
 
+/* The compile indicator is layered over the preview instead of replacing it,
+   so this wrapper — and not the scrolling container itself — is the positioning
+   context: an overlay inside an `overflow: auto` box scrolls away with the
+   content it is meant to sit on top of. */
+.pdf-viewer-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Centring a flex child that is wider (or taller) than an `overflow: auto` box
+   puts its leading edge at a negative scroll offset, and scrollable overflow
+   does not extend in that direction — so the left half of the preview became
+   unreachable at any zoom below 100%, where the iframe's (10000/zoom)% width
+   makes it wider than the pane. Both preview paths now start at the origin and
+   do their own centring inside a track that never overhangs. */
 .pdf-viewer-container {
   flex: 1;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  justify-content: center;
+  align-items: stretch;
+  justify-content: flex-start;
   padding: 20px;
   overflow: auto;
+}
+
+/* The canvas viewer scrolls itself, so the container must not also scroll:
+   two nested scroll boxes swallow the wheel event at the wrong level. */
+.pdf-viewer-container--canvas {
+  padding: 0;
+  overflow: hidden;
+}
+
+.pdf-canvas-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.pdf-canvas-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #14171b;
+}
+
+/* `max-content` plus `min-width: 100%` centres a page narrower than the pane
+   while keeping every pixel of an over-wide page inside the scrollable area. */
+.pdf-canvas-pages {
+  width: max-content;
+  min-width: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  padding: 16px;
+}
+
+.pdf-canvas-pages:empty {
+  padding: 0;
+}
+
+.pdf-page {
+  background: #fff;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+  flex: none;
+  overflow: hidden;
+}
+
+.pdf-page canvas {
+  display: block;
+}
+
+.pdf-canvas-message {
+  color: #a0a9b5;
+  text-align: center;
+  padding: 40px;
+}
+
+/* Compile indicator, layered over the last good preview.
+   `pointer-events: none` is load-bearing: auto-compile runs every couple of
+   seconds while typing, and a layer that swallowed the wheel event would stop
+   the reader scrolling the PDF underneath for the whole of every build. */
+.pdf-compile-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 12px;
+  pointer-events: none;
+  z-index: 3;
+}
+
+.pdf-compile-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  padding: 8px 12px;
+  border-radius: 6px;
+  /* Nearly opaque, bordered and shadowed because this sits on a white PDF page
+     as often as on the dark empty pane — the old spinner only ever had to be
+     legible on the dark one. */
+  background: rgba(24, 28, 33, 0.94);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  color: var(--text-main);
+  font-size: 0.8rem;
+}
+
+.pdf-compile-spinner {
+  display: inline-block;
+  font-size: 1.1rem;
+  line-height: 1;
+  animation: spin 1s linear infinite;
+}
+
+.pdf-compile-text {
+  min-width: 0;
+}
+
+.pdf-compile-step {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* The button is the one part of the overlay that must still take clicks. */
+.pdf-compile-stop {
+  pointer-events: auto;
+  flex: none;
+}
+
+/* No preview underneath yet, so the indicator owns the pane. */
+.pdf-compile-overlay--full {
+  align-items: center;
+  background: var(--bg-dark);
+  pointer-events: auto;
+}
+
+.pdf-compile-overlay--full .pdf-compile-card {
+  flex-direction: column;
+  gap: 12px;
+  padding: 40px;
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: var(--text-muted);
+  text-align: center;
+  font-size: 1rem;
+}
+
+.pdf-compile-overlay--full .pdf-compile-spinner {
+  font-size: 2rem;
+}
+
+.pdf-compile-overlay--full .pdf-compile-step {
+  margin-top: 4px;
+  font-size: 0.75rem;
 }
 
 .pdf-page-card {

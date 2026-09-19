@@ -5,6 +5,7 @@ import {
   Wifi,
   WifiOff,
   Play,
+  Square,
   UserCheck,
   FolderGit2,
   Home,
@@ -33,6 +34,16 @@ interface SyncToolbarProps {
   isCompiling: boolean;
   onSync: () => void;
   onCompile: () => void;
+  /** Kill the running engine. Only reachable while `canCancelCompile`. */
+  onCancelCompile: () => void;
+  /**
+   * True only for the engines that run a real TeX process we can kill.
+   * html-preview finishes in milliseconds and overleaf-cloud is a push that
+   * must not be interrupted half-way, so neither gets a Stop button.
+   */
+  canCancelCompile: boolean;
+  /** Which pass is running, e.g. "pdflatex — pass 2 of 3". Empty between compiles. */
+  compileStep?: string;
   onOpenAuth: () => void;
   onLogout: () => void;
   isLoggedIn: boolean;
@@ -60,6 +71,9 @@ export const SyncToolbar: React.FC<SyncToolbarProps> = ({
   isCompiling,
   onSync,
   onCompile,
+  onCancelCompile,
+  canCancelCompile,
+  compileStep,
   onOpenAuth,
   onLogout,
   isLoggedIn,
@@ -217,10 +231,38 @@ export const SyncToolbar: React.FC<SyncToolbarProps> = ({
           </select>
         )}
 
-        <button className="btn-secondary" onClick={onCompile} disabled={isCompiling}>
-          <Play size={14} fill="#6fa8cc" color="#6fa8cc" />
-          {isCompiling ? 'Compiling...' : 'Recompile'}
-        </button>
+        {/*
+          The button turns into Stop rather than sitting greyed out: a cold
+          lualatex font-cache build takes the better part of ten seconds and a
+          runaway macro never finishes at all, and until now the only thing the
+          disabled button offered was to wait it out. Stopping is local — it
+          kills our own engine process and leaves the last good PDF on screen —
+          so unlike Sync Overleaf it needs no confirmation.
+        */}
+        {isCompiling && canCancelCompile ? (
+          <button
+            className="btn-secondary"
+            onClick={onCancelCompile}
+            title="Stop the running compile. The last successful PDF stays on screen."
+          >
+            <Square size={14} fill="#c97b7b" color="#c97b7b" />
+            Stop
+          </button>
+        ) : (
+          <button className="btn-secondary" onClick={onCompile} disabled={isCompiling}>
+            <Play size={14} fill="#6fa8cc" color="#6fa8cc" />
+            {isCompiling ? 'Compiling...' : 'Recompile'}
+          </button>
+        )}
+
+        {isCompiling && compileStep && (
+          <span
+            style={{ fontSize: '0.7rem', color: '#7b8593', whiteSpace: 'nowrap' }}
+            title="A LaTeX document is compiled in several passes."
+          >
+            {compileStep}
+          </span>
+        )}
 
         <button
           className="btn-secondary"

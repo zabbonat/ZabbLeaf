@@ -24,6 +24,16 @@ export function isPlaceholderName(name: string): boolean {
   return /^Project [A-Za-z0-9]{1,8}…?\.{0,3}$/.test(name.trim());
 }
 
+/**
+ * Storage can hand back anything that survived a crash or an older build. A
+ * stored `null` made every method below throw on `localProjects.find`, and a
+ * stored `[null]` throws on the first `p.id`.
+ */
+function isProject(value: unknown): value is OverleafProject {
+  if (typeof value !== 'object' || value === null) return false;
+  return typeof (value as Partial<OverleafProject>).id === 'string';
+}
+
 export class OverleafApiService {
   private localProjects: OverleafProject[] = [];
 
@@ -35,7 +45,8 @@ export class OverleafApiService {
     try {
       const stored = localStorage.getItem(LOCAL_PROJECTS_KEY);
       if (stored) {
-        this.localProjects = JSON.parse(stored);
+        const parsed: unknown = JSON.parse(stored);
+        this.localProjects = Array.isArray(parsed) ? parsed.filter(isProject) : [];
       }
     } catch {
       this.localProjects = [];
@@ -43,7 +54,14 @@ export class OverleafApiService {
   }
 
   private saveLocalProjects() {
-    localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(this.localProjects));
+    try {
+      localStorage.setItem(LOCAL_PROJECTS_KEY, JSON.stringify(this.localProjects));
+    } catch {
+      // A full quota threw out of addProject before App.tsx ever reached
+      // setFiles, so clicking a project on the home screen did nothing at all
+      // and said nothing either. A list that cannot be remembered across
+      // restarts must still let this session open the project.
+    }
   }
 
   /**

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { appWindow } from '@tauri-apps/api/window';
+import { listen } from '@tauri-apps/api/event';
 import { SyncToolbar, CompilerEngine, CompilerOption } from './components/SyncToolbar/SyncToolbar';
 import { FileTree, FileNode } from './components/FileTree/FileTree';
 import { LaTeXEditor, EditorInsertion } from './components/Editor/LaTeXEditor';
@@ -20,6 +21,7 @@ import {
   findRootDocuments,
   defaultRootDocument
 } from './services/latexSymbols';
+import { buildProjectSources } from './services/latexCompletions';
 import { overleafCompiler } from './services/overleafCompiler';
 import { localTeXCompiler, TeXEngine, DetectedEngine } from './services/localTeXCompiler';
 import { versionHistory, VersionSnapshot } from './services/versionHistory';
@@ -42,6 +44,29 @@ import './styles/main.css';
 import './styles/panels.css';
 
 type AppView = 'home' | 'editor';
+
+/**
+ * localStorage is not always there to be written to — a browser profile with
+ * site data blocked throws outright rather than returning null, and a throw out
+ * of a lazy useState initializer takes the whole app down to a white screen. A
+ * preference that cannot be stored is a preference that falls back to its
+ * default, not a crash.
+ */
+const remember = (key: string, value: string) => {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // The setting simply does not survive this session.
+  }
+};
+
+const recall = (key: string): string | null => {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+};
 
 const DEFAULT_LATEX = `\\documentclass{article}
 \\usepackage[utf8]{inputenc}
@@ -92,8 +117,17 @@ export const App: React.FC = () => {
   const [folderPath, setFolderPath] = useState<string>('');
   const [notification, setNotification] = useState<string | null>(null);
   const [compiledPdfUrl, setCompiledPdfUrl] = useState<string | null>(null);
+  /**
+   * The same PDF as raw bytes. pdf.js renders from these, which makes a
+   * recompile a state update instead of an iframe navigation that throws away
+   * the reader's scroll position; `compiledPdfUrl` stays behind for Download
+   * and for the HTML preview, which has no bytes.
+   */
+  const [compiledPdfData, setCompiledPdfData] = useState<Uint8Array | null>(null);
   const [compiledIsPdf, setCompiledIsPdf] = useState<boolean>(false);
   const [compileLog, setCompileLog] = useState<string>('');
+  /** Which pass the engine is on, from the backend's progress events. */
+  const [compileStep, setCompileStep] = useState<string>('');
   const [snapshots, setSnapshots] = useState<VersionSnapshot[]>([]);
 
   // Compiler Engines State
@@ -109,10 +143,10 @@ export const App: React.FC = () => {
   const [changes, setChanges] = useState<{ files: string[]; diff: string } | null>(null);
   const [revealLine, setRevealLine] = useState<{ line: number; nonce: number } | null>(null);
   const [autoCompile, setAutoCompile] = useState<boolean>(
-    () => localStorage.getItem('zabbleaf_auto_compile') !== '0'
+    () => recall('zabbleaf_auto_compile') !== '0'
   );
   const [texSetupDismissed, setTexSetupDismissed] = useState<boolean>(
-    () => localStorage.getItem('zabbleaf_tex_setup_dismissed') === '1'
+    () => recall('zabbleaf_tex_setup_dismissed') === '1'
   );
 
   // Panels: widths, and which of them are open.
@@ -134,34 +168,75 @@ export const App: React.FC = () => {
   const isSyncingRef = useRef(false);
   isSyncingRef.current = isSyncing;
 
+  // Read from inside handleCompile's `finally`, which runs long after the render
+  // that started the compile: a value captured then is exactly the stale one
+  // that re-armed an auto-compile the user had just turned off.
+  const autoCompileRef = useRef(autoCompile);
+  autoCompileRef.current = autoCompile;
+  const selectedCompilerRef = useRef<CompilerEngine>(selectedCompiler);
+  selectedCompilerRef.current = selectedCompiler;
+  const currentViewRef = useRef<AppView>(currentView);
+  currentViewRef.current = currentView;
+
+  /**
+   * Bumped by every path that leaves the current project.
+   *
+   * Opening is a long chain of awaits and the Home button stays live during it,
+   * so a second project could finish first; project A's files were then set
+   * under project B's identity and the first keystroke wrote A's document into
+   * B's repository, where the next sync pushed it to B's Overleaf project.
+   */
+  const openGeneration = useRef(0);
+
   const activeFile = files.find(f => f.id === activeFileId) || files[0];
-  const projectFiles = files.map(f => ({ name: f.name, content: f.content || '' }));
-  const citations = collectCitations(projectFiles);
-  const labels = collectLabels(projectFiles);
-  const rootDocuments = findRootDocuments(projectFiles);
   const projectId = currentProject?.id || 'local-default';
-  const rootDocument =
-    chosenRoot && files.some(f => f.name === chosenRoot)
-      ? chosenRoot
-      : defaultRootDocument(rootDocuments, activeFile?.name || '');
 
   // The current file is counted live — the status bar should react as you
   // type — while anything that walks every file in the project waits until
   // typing stops, which on a thesis is the difference between smooth and not.
   const activeContent = activeFile?.content || '';
   const wordCount = useMemo(() => countWords(activeContent), [activeContent]);
-  const sections = useMemo(() => countBySection(activeContent), [activeContent]);
+  const settledContent = useDebouncedValue(activeContent);
+  const sections = useMemo(() => countBySection(settledContent), [settledContent]);
 
   const settledFiles = useDebouncedValue(files);
   const settled = useMemo(
     () => settledFiles.map(f => ({ name: f.name, content: f.content || '' })),
     [settledFiles]
   );
+
+  // Every one of these regex-scans every .tex and .bib in the project. Running
+  // them on the render path scanned the whole thesis per keystroke and handed
+  // LaTeXEditor fresh array identities each time, re-running its unknown-
+  // reference marker pass as well. Depending on `citations.length` rather than
+  // the array also left the To-do list stale when a label was renamed without
+  // changing the count.
+  const citations = useMemo(() => collectCitations(settled), [settled]);
+  const labels = useMemo(() => collectLabels(settled), [settled]);
+  const completionSources = useMemo(() => buildProjectSources(settled, assets), [settled, assets]);
+  const todos = useMemo(() => collectTodos(settled, citations, labels), [settled, citations, labels]);
   const projectWords = useMemo(() => countProjectWords(settled), [settled]);
-  const todos = useMemo(
-    () => collectTodos(settled, citations, labels),
-    [settled, citations.length, labels.length]
+
+  /**
+   * Deliberately on the live `files`, not on `settled`.
+   *
+   * `useDebouncedValue` keeps the *previous* value until its timer fires, so for
+   * 600 ms after a project opens `settled` still holds the project the user just
+   * left. Recompiling in that window picked that project's root and failed with
+   * "main.tex does not exist in this project". This is a `\documentclass`
+   * substring test per .tex file, not one of the project-wide regex passes
+   * above, so running it per keystroke costs nothing worth debouncing.
+   */
+  const rootDocuments = useMemo(
+    () => findRootDocuments(files.map(f => ({ name: f.name, content: f.content || '' }))),
+    [files]
   );
+
+  const rootDocument =
+    chosenRoot && files.some(f => f.name === chosenRoot)
+      ? chosenRoot
+      : defaultRootDocument(rootDocuments, activeFile?.name || '');
+
   const writingSummary = useMemo(
     () => writingStats.summary(projectId),
     [projectId, writingTick]
@@ -221,12 +296,12 @@ ${result.log}`);
 
   const handleChooseRoot = (fileName: string) => {
     setChosenRoot(fileName);
-    localStorage.setItem(`zabbleaf_root_${projectId}`, fileName);
+    remember(`zabbleaf_root_${projectId}`, fileName);
   };
 
   const handleDismissTexSetup = () => {
     setTexSetupDismissed(true);
-    localStorage.setItem('zabbleaf_tex_setup_dismissed', '1');
+    remember('zabbleaf_tex_setup_dismissed', '1');
   };
 
   const compilerOptions: CompilerOption[] = [
@@ -302,85 +377,311 @@ ${result.log}`);
   // Editing fires on every keystroke; writing through to disk that often would
   // stutter the editor, so coalesce writes per file.
   const saveTimers = useRef<Record<string, number>>({});
+  // The text waiting behind each timer. Closing the window within 400 ms of the
+  // last keystroke used to drop that edit from disk entirely, and because sync
+  // only writes files React still marks modified, it was gone from the next
+  // session too.
+  const pendingSaves = useRef<Record<string, { project: string; fileName: string; content: string }>>({});
+  // A save that has started failing is worth saying once, not per keystroke.
+  const saveFailed = useRef(false);
 
   const queueSave = (project: string, fileName: string, content: string) => {
     const key = `${project}:${fileName}`;
     window.clearTimeout(saveTimers.current[key]);
-    saveTimers.current[key] = window.setTimeout(() => {
+    pendingSaves.current[key] = { project, fileName, content };
+    saveTimers.current[key] = window.setTimeout(async () => {
       delete saveTimers.current[key];
-      gitSyncEngine.writeFile(project, fileName, content).catch(console.error);
+      delete pendingSaves.current[key];
+      const result = await gitSyncEngine.writeFile(project, fileName, content);
+      if (result.success) {
+        saveFailed.current = false;
+      } else if (!saveFailed.current) {
+        saveFailed.current = true;
+        showNotification(`❌ Could not save ${fileName}: ${result.message}`);
+      }
     }, 400);
   };
 
+  // Read by flushPendingSaves, which is a stable callback the close handler
+  // registered once at mount and so cannot close over the current file list.
+  const filesRef = useRef<FileNode[]>(files);
+  filesRef.current = files;
+
+  /** Finishes every debounced write that has not fired yet. */
+  const flushPendingSaves = useCallback(async () => {
+    const outstanding = Object.values(pendingSaves.current);
+    pendingSaves.current = {};
+    for (const key of Object.keys(saveTimers.current)) {
+      window.clearTimeout(saveTimers.current[key]);
+    }
+    saveTimers.current = {};
+
+    const writes = [...outstanding];
+
+    // `isModified` is the superset the queue is not, and the compile and sync
+    // flushes already use it: handleRestoreVersion marks a file modified without
+    // ever going through queueSave, so a restored version was dropped on the
+    // next Home, project switch or quit with nothing on screen to say so.
+    const project = currentProjectRef.current;
+    if (project) {
+      const queued = new Set(writes.map(w => `${w.project}:${w.fileName}`));
+      for (const f of filesRef.current) {
+        if (!f.isModified) continue;
+        const key = `${project.id}:${f.name}`;
+        if (queued.has(key)) continue;
+        writes.push({ project: project.id, fileName: f.name, content: f.content || '' });
+      }
+    }
+
+    await Promise.all(
+      writes.map(save => gitSyncEngine.writeFile(save.project, save.fileName, save.content))
+    );
+  }, []);
+
+  // `isCompiling` is state, so a check against it inside a timer callback reads
+  // the value from the render that armed the timer: an armed auto-compile
+  // survived into a compile the user had started by hand and fired a second
+  // one. The in-flight guard has to be a ref, read the moment a compile starts.
+  const compileInFlight = useRef(false);
+  const compileAgain = useRef(false);
+  const autoCompileTimer = useRef<number | undefined>(undefined);
+  // The timer calls through a ref so it always runs the newest handleCompile:
+  // a stale one closes over an older `files` and writes it back over newer
+  // on-disk content.
+  const handleCompileRef = useRef<() => void>(() => {});
+  /**
+   * Set by Stop when the backend had nothing to kill yet.
+   *
+   * The pre-compile flush blocks on the project's repository lock while a sync
+   * holds it, so Stop can land before `zl_compile_project` has registered a
+   * process. `zl_cancel_compile` then returns false and the engine runs to
+   * completion; without this flag its PDF and log replaced the ones the user
+   * pressed Stop to keep.
+   */
+  const stopRequested = useRef(false);
+
+  /**
+   * Set when a compile was asked for outright rather than by the idle timer.
+   *
+   * Installing a missing package recompiles to show the fix worked. That queues
+   * behind the compile still running, and re-arming only when auto-compile is on
+   * dropped it: with the setting off the user got "✅ Installed fontspec" over
+   * the same failing log and the same diagnostic.
+   */
+  const compileRequested = useRef(false);
+
   const handleCompile = useCallback(async () => {
+    if (compileInFlight.current) {
+      compileAgain.current = true;
+      return;
+    }
+    compileInFlight.current = true;
+    // The compile it asked for is starting now, so the flag has done its job.
+    compileRequested.current = false;
+    stopRequested.current = false;
     setIsCompiling(true);
     const content = activeFile?.content || '';
 
-    if (selectedCompiler === 'html-preview') {
-      const result = await latexCompiler.compile(content);
-      setIsCompiling(false);
+    // Every path out of this project bumps the generation. A compile is the one
+    // long-running handler that had no such guard, so a slow engine finishing
+    // after the user pressed Home wrote its PDF, log and version snapshot into
+    // whatever project was opened next.
+    const generation = openGeneration.current;
+    const stale = () => openGeneration.current !== generation;
 
-      if (result.success && result.pdfUrl) {
-        setCompiledPdfUrl(result.pdfUrl);
-        setCompiledIsPdf(false);
-        setCompileLog(result.log);
-        versionHistory.saveSnapshot(projectId, activeFile?.name || 'main.tex', content, `Compiled ${activeFile?.name}`);
-        setSnapshots(versionHistory.getProjectHistory(projectId));
-        showNotification(`✅ Quick Preview generated in ${result.compileTimeMs.toFixed(0)}ms`);
+    try {
+      if (selectedCompiler === 'html-preview') {
+        const result = await latexCompiler.compile(content);
+        if (stale()) return;
+
+        if (result.success && result.pdfUrl) {
+          setCompiledPdfUrl(result.pdfUrl);
+          setCompiledIsPdf(false);
+          // The quick preview is HTML. Leaving the last engine's bytes in place
+          // would keep the canvas viewer showing a document nobody asked for.
+          setCompiledPdfData(null);
+          setCompileLog(result.log);
+          versionHistory.saveSnapshot(projectId, activeFile?.name || 'main.tex', content, `Compiled ${activeFile?.name}`);
+          setSnapshots(versionHistory.getProjectHistory(projectId));
+          showNotification(`✅ Quick Preview generated in ${result.compileTimeMs.toFixed(0)}ms`);
+        } else {
+          setCompileLog(result.log);
+          showNotification('❌ Compilation failed. Check the log output.');
+        }
+      } else if (selectedCompiler === 'overleaf-cloud') {
+        if (!currentProject) {
+          showNotification('⚠️ Open a project to compile with Overleaf Cloud.');
+          return;
+        }
+        // This pushes to the real Overleaf project, so never do it silently.
+        const confirmed = window.confirm(
+          `Compiling on Overleaf pushes your local changes to "${currentProject.name}" ` +
+          `and opens the project in your browser, where Overleaf compiles it.\n\n` +
+          `Overleaf blocks embedding, so the PDF cannot appear inside ZabbLeaf.\n\nPush and open now?`
+        );
+        if (!confirmed) return;
+
+        const fileList = files.map(f => ({ name: f.name, content: f.content || '' }));
+        const result = await overleafCompiler.compile(currentProject.id, fileList);
+        // The push already happened, so the user is told either way — but the
+        // log belongs to a project that may no longer be the one on screen.
+        if (!stale()) setCompileLog(result.log);
+        showNotification(
+          result.success
+            ? '🌐 Pushed to Overleaf and opened in your browser.'
+            : `❌ ${result.errors[0] || 'Overleaf compilation failed.'}`
+        );
       } else {
+        // Local TeX compilation (pdflatex, xelatex, lualatex). The engine reads
+        // files from disk, so flush the editor first — and compile the whole
+        // project directory so \input, .bib and class files resolve.
+        //
+        // `isModified` rather than a pending save timer: handleRestoreVersion
+        // marks a file modified without ever queuing a save, so a compile right
+        // after restoring a version would otherwise use the stale disk copy.
+        const fileName = rootDocument;
+        for (const f of files) {
+          if (!f.isModified) continue;
+          const written = await gitSyncEngine.writeFile(projectId, f.name, f.content || '');
+          if (!written.success) {
+            // Compiling on text we failed to save would report errors about a
+            // document the user cannot see. The `finally` clears isCompiling.
+            showNotification(`❌ Could not save ${f.name}: ${written.message}`);
+            return;
+          }
+        }
+
+        // The flush above can sit on the repository lock for the length of a
+        // sync; starting an engine for a project the user has since left only
+        // holds that lock longer for the project they moved to.
+        if (stale()) return;
+
+        const result = await localTeXCompiler.compile(projectId, fileName, selectedCompiler as TeXEngine);
+        if (stale()) return;
+
+        // A Stop is not a failure: the engine was killed on purpose and the
+        // last good PDF, log and diagnostics are still the truth on screen.
+        // Nulling compiledPdfData here blanks the preview, which is precisely
+        // what the cancelled flag exists to prevent. `stopRequested` covers the
+        // Stop that arrived before the backend had a process to report killing.
+        if (result.cancelled || stopRequested.current) return;
+
         setCompileLog(result.log);
-        showNotification('❌ Compilation failed. Check the log output.');
-      }
-    } else if (selectedCompiler === 'overleaf-cloud') {
-      if (!currentProject) {
-        setIsCompiling(false);
-        showNotification('⚠️ Open a project to compile with Overleaf Cloud.');
-        return;
-      }
-      // This pushes to the real Overleaf project, so never do it silently.
-      const confirmed = window.confirm(
-        `Compiling on Overleaf pushes your local changes to "${currentProject.name}" ` +
-        `and opens the project in your browser, where Overleaf compiles it.\n\n` +
-        `Overleaf blocks embedding, so the PDF cannot appear inside ZabbLeaf.\n\nPush and open now?`
-      );
-      if (!confirmed) {
-        setIsCompiling(false);
-        return;
-      }
 
-      const fileList = files.map(f => ({ name: f.name, content: f.content || '' }));
-      const result = await overleafCompiler.compile(currentProject.id, fileList);
+        if (result.success && result.pdfUrl) {
+          setCompiledPdfUrl(result.pdfUrl);
+          setCompiledIsPdf(true);
+          setCompiledPdfData(result.pdfData);
+          versionHistory.saveSnapshot(projectId, fileName, content, `Compiled with ${selectedCompiler}`);
+          setSnapshots(versionHistory.getProjectHistory(projectId));
+          showNotification(`✅ Compiled ${fileName} with ${selectedCompiler}.`);
+        } else {
+          showNotification(`❌ ${result.errors[0] || `${selectedCompiler} compilation failed.`}`);
+        }
+      }
+    } finally {
+      compileInFlight.current = false;
       setIsCompiling(false);
-      setCompileLog(result.log);
-      showNotification(
-        result.success
-          ? '🌐 Pushed to Overleaf and opened in your browser.'
-          : `❌ ${result.errors[0] || 'Overleaf compilation failed.'}`
-      );
-    } else {
-      // Local TeX compilation (pdflatex, xelatex, lualatex). The engine reads
-      // files from disk, so flush the editor first — and compile the whole
-      // project directory so \input, .bib and class files resolve.
-      const fileName = rootDocument;
-      for (const f of files) {
-        await gitSyncEngine.writeFile(projectId, f.name, f.content || '');
-      }
-
-      const result = await localTeXCompiler.compile(projectId, fileName, selectedCompiler as TeXEngine);
-      setIsCompiling(false);
-      setCompileLog(result.log);
-
-      if (result.success && result.pdfUrl) {
-        setCompiledPdfUrl(result.pdfUrl);
-        setCompiledIsPdf(true);
-        versionHistory.saveSnapshot(projectId, fileName, content, `Compiled with ${selectedCompiler}`);
-        setSnapshots(versionHistory.getProjectHistory(projectId));
-        showNotification(`✅ Compiled ${fileName} with ${selectedCompiler}.`);
-      } else {
-        showNotification(`❌ ${result.errors[0] || `${selectedCompiler} compilation failed.`}`);
+      setCompileStep('');
+      const requested = compileRequested.current;
+      compileRequested.current = false;
+      if (compileAgain.current) {
+        compileAgain.current = false;
+        // Edits that arrived while the engine ran would otherwise never
+        // compile: the auto-compile effect does not re-run when isCompiling
+        // clears. 400 ms, not 2000 — the user already paused for two seconds
+        // before this compile began, and sharing autoCompileTimer means a
+        // keystroke still pushes it back out.
+        //
+        // Every condition the auto-compile effect checks is re-checked here,
+        // through refs so this sees the settings as they are now rather than as
+        // they were when the compile started. Turning auto-compile off during a
+        // slow run still got one more compile, and switching the dropdown —
+        // which stays live while compiling — to Overleaf Cloud popped the "Push
+        // and open now?" confirm as a side effect of typing, which is exactly
+        // what that engine's exclusion from auto-compile exists to prevent.
+        // `requested` overrides only the auto-compile setting: an explicit ask
+        // is not the idle timer, so turning that setting off must not discard
+        // it. The other two conditions hold either way — the project is gone,
+        // or the engine is the one that pushes to Overleaf.
+        const canQueue =
+          !stale() &&
+          (requested || autoCompileRef.current) &&
+          selectedCompilerRef.current !== 'overleaf-cloud' &&
+          currentViewRef.current === 'editor';
+        if (canQueue) {
+          window.clearTimeout(autoCompileTimer.current);
+          autoCompileTimer.current = window.setTimeout(() => handleCompileRef.current(), 400);
+        }
       }
     }
   }, [activeFile, currentProject, files, projectId, selectedCompiler, rootDocument]);
+
+  useEffect(() => {
+    handleCompileRef.current = handleCompile;
+  }, [handleCompile]);
+
+  /** Kills the running engine. Only reachable for a real TeX process. */
+  const handleCancelCompile = useCallback(async () => {
+    // Deliberately does not clear isCompiling: the in-flight promise resolves
+    // with cancelled:true on its own, and clearing early would let a new
+    // compile start before the engine has actually died.
+    compileAgain.current = false;
+    // Set before the call, not after it: the engine can finish between the two.
+    stopRequested.current = true;
+    const stopped = await localTeXCompiler.cancel(projectId);
+    if (!stopped) {
+      // No engine to kill: the compile is still in its pre-engine phase,
+      // blocked behind another project operation on the repository lock, or it
+      // finished in the moment between the click and this call. Either way the
+      // flag above is what makes this Stop stick — handleCompile drops the
+      // result when it arrives instead of replacing the PDF on screen — and the
+      // spinner stays up until it does, so say so rather than looking hung.
+      showNotification('⏹️ Stop requested — this compile will be discarded when it finishes.');
+    }
+  }, [projectId]);
+
+  // html-preview finishes in milliseconds and overleaf-cloud is a push that
+  // must not be interrupted half-way, so neither gets a Stop button.
+  const canCancelCompile =
+    selectedCompiler === 'pdflatex' ||
+    selectedCompiler === 'xelatex' ||
+    selectedCompiler === 'lualatex';
+
+  // Which pass the engine is on. Filtered by project because the listener
+  // outlives any one compile, and a leftover label from the project the user
+  // just left would sit in the toolbar as if it were still running.
+  useEffect(() => {
+    let cancelled = false;
+    let dispose: (() => void) | undefined;
+
+    listen<{ projectId: string; label: string }>('zl://compile-progress', event => {
+      if (event.payload.projectId !== projectId) return;
+      setCompileStep(event.payload.label);
+    })
+      .then(unlisten => {
+        if (cancelled) unlisten();
+        else dispose = unlisten;
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
+  }, [projectId]);
+
+  // Leaving a project must not leave its engine running: it holds the repo lock
+  // the next project's clone or sync needs, and its output is already orphaned.
+  useEffect(
+    () => () => {
+      // Not user-initiated: this must kill a running engine without arming a
+      // Stop, or switching away and back inside the arming window silently
+      // cancels the returning project's first compile.
+      void localTeXCompiler.cancel(projectId, false);
+    },
+    [projectId]
+  );
 
   /**
    * Attaches a locally-created project to an existing Overleaf project.
@@ -424,11 +725,19 @@ ${result.log}`);
     }
 
     // A blank Overleaf project still ships its own main.tex. Never silently
-    // destroy remote content the user may care about.
-    const remoteFiles = await gitSyncEngine.readProjectFiles(remoteId);
-    const clashes = remoteFiles.filter(remote => {
-      const local = files.find(f => f.name === remote.name);
-      return local && (local.content || '') !== remote.content;
+    // destroy remote content the user may care about — and a read we could not
+    // perform is not evidence that there is nothing there.
+    const remote = await gitSyncEngine.readProjectFiles(remoteId);
+    if (!remote.success) {
+      if (!alreadyHadCopy) await gitSyncEngine.deleteProject(remoteId);
+      setIsSyncing(false);
+      showNotification(`❌ Could not read the Overleaf project: ${remote.message}`);
+      return null;
+    }
+
+    const clashes = remote.files.filter(file => {
+      const local = files.find(f => f.name === file.name);
+      return local && (local.content || '') !== file.content;
     });
 
     if (clashes.length > 0) {
@@ -445,7 +754,14 @@ ${result.log}`);
     }
 
     for (const f of files) {
-      await gitSyncEngine.writeFile(remoteId, f.name, f.content || '');
+      const written = await gitSyncEngine.writeFile(remoteId, f.name, f.content || '');
+      if (!written.success) {
+        // Stop rather than roll back: the clone is already partly populated and
+        // deleting it would destroy the copies that did land.
+        setIsSyncing(false);
+        showNotification(`❌ Could not copy ${f.name} into the Overleaf project: ${written.message}`);
+        return null;
+      }
     }
 
     // The project takes on the Overleaf id from here on; the old local entry
@@ -466,23 +782,25 @@ ${result.log}`);
     return remoteId;
   };
 
-  const autoCompileTimer = useRef<number | undefined>(undefined);
-
   useEffect(() => {
     // Deliberately never for 'overleaf-cloud': that engine pushes to the real
     // project, which must stay a decision, not a side effect of typing.
     if (!autoCompile || selectedCompiler === 'overleaf-cloud') return;
-    if (currentView !== 'editor' || isCompiling) return;
+    // No isCompiling check here on purpose: it is state read from the render
+    // that armed the timer, so it was never the value that mattered. The
+    // in-flight ref inside handleCompile is the real guard, and it re-arms
+    // itself for the edits that arrived while the engine ran.
+    if (currentView !== 'editor') return;
 
     window.clearTimeout(autoCompileTimer.current);
-    autoCompileTimer.current = window.setTimeout(() => handleCompile(), 2000);
+    autoCompileTimer.current = window.setTimeout(() => handleCompileRef.current(), 2000);
     return () => window.clearTimeout(autoCompileTimer.current);
   }, [activeFile?.content, activeFileId, autoCompile, selectedCompiler, currentView]);
 
   const handleToggleAutoCompile = () => {
     const next = !autoCompile;
     setAutoCompile(next);
-    localStorage.setItem('zabbleaf_auto_compile', next ? '1' : '0');
+    remember('zabbleaf_auto_compile', next ? '1' : '0');
   };
 
   /** Pushes silently when the network returns, if there is anything waiting. */
@@ -493,7 +811,9 @@ ${result.log}`);
     if (!(await gitSyncEngine.hasProject(project.id))) return;
 
     const pending = await gitSyncEngine.getChanges(project.id);
-    if (pending.files.length === 0) return;
+    // A read that failed is not the same as nothing to push; pushing anyway
+    // would skip the review the user is entitled to.
+    if (!pending.success || pending.files.length === 0) return;
 
     setIsSyncing(true);
     setNotification('🔄 Back online — syncing your changes...');
@@ -587,7 +907,11 @@ ${result.log}`);
     if (!window.confirm(`Delete "${path}"?\n\nIt goes from your computer, and from Overleaf on the next sync.`)) {
       return;
     }
-    await gitSyncEngine.deleteFile(projectId, path).catch(console.error);
+    const removed = await gitSyncEngine.deleteFile(projectId, path);
+    if (!removed.success) {
+      showNotification(`❌ Could not delete ${path}: ${removed.message}`);
+      return;
+    }
     await refreshAssets(projectId);
     showNotification(`🗑️ Deleted ${path}`);
   };
@@ -600,6 +924,11 @@ ${result.log}`);
    */
   useEffect(() => {
     if (currentView !== 'editor') return;
+    // The cleanup used to fire while the registration promise was still
+    // pending, so in StrictMode and on any project switch during the IPC round
+    // trip the old listener stayed attached: one dropped image was imported
+    // twice and two figure blocks were inserted.
+    let cancelled = false;
     let dispose: (() => void) | undefined;
 
     appWindow
@@ -626,12 +955,67 @@ ${result.log}`);
         showNotification(`🖼️ Added ${added.join(', ')}`);
       })
       .then(unlisten => {
-        dispose = unlisten;
+        if (cancelled) unlisten();
+        else dispose = unlisten;
       })
       .catch(console.error);
 
-    return () => dispose?.();
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
   }, [currentView, projectId, refreshAssets]);
+
+  /**
+   * Finishes outstanding writes before the window goes away.
+   *
+   * Tauri's wrapper closes the window itself once this handler resolves unless
+   * preventDefault was called, so the flush has to happen inside it; the
+   * explicit close() that follows is routed straight to the runtime's window
+   * teardown and does not raise this event again.
+   */
+  const closing = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let dispose: (() => void) | undefined;
+
+    appWindow
+      .onCloseRequested(async event => {
+        // An impatient second click on the X does raise it again; running the
+        // flush twice would re-write files the first pass already saved.
+        event.preventDefault();
+        if (closing.current) return;
+        closing.current = true;
+
+        try {
+          // A write that hangs must not make the window impossible to close.
+          await Promise.race([
+            flushPendingSaves(),
+            new Promise<void>(resolve => window.setTimeout(resolve, 3000))
+          ]);
+        } finally {
+          try {
+            await appWindow.close();
+          } catch (err) {
+            // Leaving the latch set would make the X dead for the rest of the
+            // session; better to let the next click try again.
+            closing.current = false;
+            console.error('[App] Could not close the window:', err);
+          }
+        }
+      })
+      .then(unlisten => {
+        if (cancelled) unlisten();
+        else dispose = unlisten;
+      })
+      .catch(console.error);
+
+    return () => {
+      cancelled = true;
+      dispose?.();
+    };
+  }, [flushPendingSaves]);
 
   /** Installs the package a compiler error asked for, then recompiles. */
   const handleInstallPackage = async (packageName: string) => {
@@ -640,7 +1024,12 @@ ${result.log}`);
     const result = await localTeXCompiler.installPackage(packageName);
     setInstallingPackage('');
     showNotification(result.success ? `✅ ${result.message}` : `❌ ${result.message}`);
-    if (result.success) handleCompile();
+    if (result.success) {
+      // Marked before the call so that if a compile is still running, the queued
+      // re-arm knows this one was asked for rather than timed out into.
+      compileRequested.current = true;
+      handleCompile();
+    }
   };
 
   /**
@@ -667,10 +1056,32 @@ ${result.log}`);
 
   const handleSync = async () => {
     if (!currentProject) return;
+    // The Sync button stays live until setIsSyncing(true) far below, so a
+    // double click started two syncs against the same repository.
+    if (isSyncingRef.current) return;
+
+    // Opening another project mid-sync must not let this one's reload land
+    // under the new project's identity.
+    const generation = openGeneration.current;
+    const stale = () => openGeneration.current !== generation;
 
     // Linking changes which project we are syncing, and setCurrentProject only
     // takes effect on the next render — so track the id explicitly.
     let syncId = currentProject.id;
+
+    // git reads the working tree, not the editor. Reports the first failure
+    // rather than pushing a document whose newest text never reached disk.
+    const flushModified = async (id: string): Promise<boolean> => {
+      for (const f of files) {
+        if (!f.isModified) continue;
+        const written = await gitSyncEngine.writeFile(id, f.name, f.content || '');
+        if (!written.success) {
+          showNotification(`❌ Could not save ${f.name}: ${written.message}`);
+          return false;
+        }
+      }
+      return true;
+    };
 
     // A project with no git repository has no Overleaf counterpart yet: either
     // it was created locally, or its local copy was removed.
@@ -705,12 +1116,17 @@ ${result.log}`);
     }
 
     // Show what is about to go up before it goes up.
-    for (const f of files) {
-      if (f.isModified) await gitSyncEngine.writeFile(syncId, f.name, f.content || '');
-    }
+    if (!(await flushModified(syncId))) return;
+
     const pending = await gitSyncEngine.getChanges(syncId);
+    if (!pending.success) {
+      // Reading this as "nothing to review" is how a push happened without the
+      // diff ever being shown.
+      showNotification(`❌ Could not read what has changed: ${pending.message}`);
+      return;
+    }
     if (pending.files.length > 0 && !changes) {
-      setChanges(pending);
+      setChanges({ files: pending.files, diff: pending.diff });
       return;
     }
     setChanges(null);
@@ -718,19 +1134,22 @@ ${result.log}`);
     setIsSyncing(true);
     setNotification('🔄 Syncing with Overleaf...');
 
-    // Flush every edit to disk before git looks at the working tree.
-    for (const f of files) {
-      if (f.isModified) {
-        await gitSyncEngine.writeFile(syncId, f.name, f.content || '');
-      }
+    // Flush again: the review modal has been on screen, and the editor stayed
+    // live behind it.
+    if (!(await flushModified(syncId))) {
+      setIsSyncing(false);
+      return;
     }
 
     const result = await gitSyncEngine.syncProject(syncId);
 
     // Reload from disk so a rebase that brought in remote edits is reflected.
-    const updatedFiles = await gitSyncEngine.readProjectFiles(syncId);
-    if (updatedFiles.length > 0) {
-      setFiles(updatedFiles.map(f => ({
+    const updated = await gitSyncEngine.readProjectFiles(syncId);
+    // Another project was opened while git ran; these files belong to the one
+    // the user just left, and setting them now would put them under the new
+    // project's id — where the next sync would push them to its Overleaf copy.
+    if (!stale() && updated.success && updated.files.length > 0) {
+      setFiles(updated.files.map(f => ({
         id: f.name,
         name: f.name,
         type: 'file',
@@ -738,8 +1157,8 @@ ${result.log}`);
         isModified: false,
         lastSynced: new Date().toISOString()
       })));
-      if (!updatedFiles.find(f => f.name === activeFileId)) {
-        setActiveFileId(updatedFiles[0].name);
+      if (!updated.files.find(f => f.name === activeFileId)) {
+        setActiveFileId(updated.files[0].name);
       }
     }
 
@@ -794,7 +1213,9 @@ ${result.log}`);
     setFiles(prev => [...prev, { id: newId, name: fileName, type: 'file', content: defaultContent }]);
     setActiveFileId(newId);
     if (currentProject) {
-      gitSyncEngine.writeFile(currentProject.id, fileName, defaultContent).catch(console.error);
+      void gitSyncEngine.writeFile(currentProject.id, fileName, defaultContent).then(written => {
+        if (!written.success) showNotification(`❌ Could not create ${fileName}: ${written.message}`);
+      });
     }
     showNotification(`📄 Created "${fileName}"`);
   };
@@ -816,7 +1237,18 @@ ${result.log}`);
     // Also remove it from disk. Dropping it from the list alone left the file
     // in place, so git saw no deletion and it reappeared on the next open.
     if (currentProject) {
-      gitSyncEngine.deleteFile(currentProject.id, target.name).catch(console.error);
+      // Drop the debounced write for this file first. Writes run on the backend's
+      // blocking pool behind a per-project lock, so one issued before the delete
+      // could land after it and recreate the file — and `git add -A` on the next
+      // sync would push the deleted file straight back up to Overleaf.
+      const pendingKey = `${currentProject.id}:${target.name}`;
+      window.clearTimeout(saveTimers.current[pendingKey]);
+      delete saveTimers.current[pendingKey];
+      delete pendingSaves.current[pendingKey];
+
+      void gitSyncEngine.deleteFile(currentProject.id, target.name).then(removed => {
+        if (!removed.success) showNotification(`❌ Could not delete ${target.name}: ${removed.message}`);
+      });
     }
     showNotification(`🗑️ Deleted "${target.name}"`);
   };
@@ -833,21 +1265,65 @@ ${result.log}`);
     } catch { /* cancelled */ }
   };
 
+  /** Turns a file list from disk into editor state. */
+  const asFileNodes = (loaded: { name: string; content: string }[]): FileNode[] =>
+    loaded.map(f => ({
+      id: f.name,
+      name: f.name,
+      type: 'file' as const,
+      content: f.content,
+      isModified: false,
+      lastSynced: new Date().toISOString()
+    }));
+
   const handleOpenProject = async (project: OverleafProject, template?: ProjectTemplate) => {
+    const generation = ++openGeneration.current;
+    const stale = () => openGeneration.current !== generation;
+
+    // The previous project's queued compile must not fire into this one.
+    compileAgain.current = false;
+    window.clearTimeout(autoCompileTimer.current);
+
+    // Whatever the previous project still had queued belongs to the previous
+    // project's directory, and queueSave's key namespaces it by id — but an
+    // unflushed write racing this project's read is a lost edit either way.
+    await flushPendingSaves();
+    if (stale()) return;
+
     console.log(`[OPEN-PROJECT] id="${project.id}" name="${project.name}" local=${project.isLocal}`);
     setCurrentProject(project);
     setCurrentView('editor');
     setFiles([]);
     setActiveFileId('');
     setAssets([]);
+
+    // The previous project's PDF, log and pending diff describe a document that
+    // is no longer open: its clickable error list points at files the editor
+    // cannot show, and its bytes would keep rendering in the preview pane.
+    localTeXCompiler.reset();
+    latexCompiler.reset();
+    setCompiledPdfUrl(null);
+    setCompiledPdfData(null);
+    setCompiledIsPdf(false);
+    setCompileLog('');
+    setCompileStep('');
+    setChanges(null);
+
     overleafApi.addProject(project);
 
-    setChosenRoot(localStorage.getItem(`zabbleaf_root_${project.id}`) || '');
+    setChosenRoot(recall(`zabbleaf_root_${project.id}`) || '');
 
     const alreadyOnDisk = await gitSyncEngine.hasProject(project.id);
+    if (stale()) return;
     console.log(`[OPEN-PROJECT] Already cloned: ${alreadyOnDisk}`);
 
-    if (!alreadyOnDisk && !project.isLocal) {
+    // `isLocal` is set true on every successful open, so gating the re-download
+    // on it made this branch dead from the second open onwards — and a missing
+    // clone then fell through to the starter branch below, which wrote
+    // DEFAULT_LATEX over whatever the repository actually held.
+    const isOverleafProject = !project.id.startsWith('local-');
+
+    if (!alreadyOnDisk && isOverleafProject) {
       if (!gitSyncEngine.getCredentials()?.gitToken) {
         // Reopen this project automatically once the token is saved.
         setPendingProject(project);
@@ -860,6 +1336,7 @@ ${result.log}`);
       setNotification('⬇️ Downloading project from Overleaf...');
       const res = await gitSyncEngine.cloneProject(project.id);
       setIsSyncing(false);
+      if (stale()) return;
       console.log(`[OPEN-PROJECT] Clone: success=${res.success} message="${res.message}"`);
 
       if (!res.success) {
@@ -868,21 +1345,24 @@ ${result.log}`);
       }
     }
 
-    const loaded = await gitSyncEngine.readProjectFiles(project.id);
+    const read = await gitSyncEngine.readProjectFiles(project.id);
+    if (stale()) return;
+
+    if (!read.success) {
+      // Falling through from here is what wrote a blank main.tex over a project
+      // we had merely failed to read.
+      showNotification(`❌ Could not read this project's files: ${read.message}`);
+      return;
+    }
+
+    const loaded = read.files;
     console.log(`[OPEN-PROJECT] Loaded ${loaded.length} files: ${loaded.map(f => f.name).join(', ')}`);
 
     // Figures are not text, so they never come back with the files above.
     refreshAssets(project.id).catch(console.error);
 
     if (loaded.length > 0) {
-      setFiles(loaded.map(f => ({
-        id: f.name,
-        name: f.name,
-        type: 'file',
-        content: f.content,
-        isModified: false,
-        lastSynced: new Date().toISOString()
-      })));
+      setFiles(asFileNodes(loaded));
       setActiveFileId(loaded[0].name);
 
       // A project added from a URL starts out named after its id. Overleaf's
@@ -907,11 +1387,45 @@ ${result.log}`);
       return;
     }
 
-    // Nothing readable on disk: a brand-new local project, or an Overleaf
-    // project whose repository holds no text files.
+    // Nothing readable on disk. Only a genuinely new project gets a starter
+    // document: an existing Overleaf project that reads as empty is far more
+    // likely to be one whose files we could not see than one that has none.
+    const isNew = template !== undefined || !isOverleafProject;
+    if (!isNew) {
+      showNotification('⚠️ This Overleaf project has no text files yet.');
+      return;
+    }
+
     const starter = template
       ? template.files
       : [{ name: 'main.tex', content: DEFAULT_LATEX }];
+
+    // writeNewFile rather than writeFile: if anything is already at that path
+    // it is the user's document, not ours to replace.
+    let clobbered = false;
+    for (const file of starter) {
+      const written = await gitSyncEngine.writeNewFile(project.id, file.name, file.content);
+      if (stale()) return;
+      if (!written.success) {
+        showNotification(`❌ Could not create ${file.name}: ${written.message}`);
+        return;
+      }
+      if (!written.written) clobbered = true;
+    }
+
+    if (clobbered) {
+      // Something was there after all, so show that rather than the starter.
+      const reread = await gitSyncEngine.readProjectFiles(project.id);
+      if (stale()) return;
+      if (reread.success && reread.files.length > 0) {
+        setFiles(asFileNodes(reread.files));
+        setActiveFileId(reread.files[0].name);
+        showNotification(
+          `✅ Opened "${project.name}" — ${reread.files.length} file${reread.files.length === 1 ? '' : 's'} already on disk.`
+        );
+        return;
+      }
+    }
 
     setFiles(
       starter.map(file => ({
@@ -923,18 +1437,30 @@ ${result.log}`);
     );
     setActiveFileId(starter[0].name);
 
-    for (const file of starter) {
-      await gitSyncEngine.writeFile(project.id, file.name, file.content);
-    }
-
     showNotification(
       template
         ? `📄 Created "${project.name}" from the ${template.name.toLowerCase()} template.`
-        : project.isLocal
-          ? `📄 Created "${project.name}" with a starter main.tex.`
-          : '⚠️ This Overleaf project has no text files — starting from a blank main.tex.'
+        : `📄 Created "${project.name}" with a starter main.tex.`
     );
   };
+
+  /**
+   * Leaving the editor for the project list.
+   *
+   * Bumping the generation is what stops an open() still running in the
+   * background from landing its files after the user has moved on.
+   */
+  const handleGoHome = useCallback(async () => {
+    openGeneration.current += 1;
+    // A compile still running re-arms itself from its `finally`, which runs
+    // after this. The generation check there covers it, but dropping the queued
+    // run and the armed timer here is what stops the auto-compile effect's
+    // already-returned cleanup from leaving a live timer behind.
+    compileAgain.current = false;
+    window.clearTimeout(autoCompileTimer.current);
+    await flushPendingSaves();
+    setCurrentView('home');
+  }, [flushPendingSaves]);
 
   const handleSaveCredentials = (email: string, _token: string, _projectId: string) => {
     setIsLoggedIn(true);
@@ -969,6 +1495,10 @@ ${result.log}`);
     if (file) {
       setFiles(prev => prev.map(f => f.name === snapshot.fileName ? { ...f, content: snapshot.content, isModified: true } : f));
       setActiveFileId(file.id);
+      // Marking it modified is not enough on its own: nothing else writes it
+      // through, so a restore the user was happy with existed only in memory
+      // until the next compile or sync.
+      if (currentProject) queueSave(currentProject.id, snapshot.fileName, snapshot.content);
       showNotification(`↩️ Restored "${snapshot.fileName}" to version from ${new Date(snapshot.timestamp).toLocaleTimeString()}`);
     }
   };
@@ -1039,10 +1569,13 @@ ${result.log}`);
         isCompiling={isCompiling}
         onSync={handleSync}
         onCompile={handleCompile}
+        onCancelCompile={handleCancelCompile}
+        canCancelCompile={canCancelCompile}
+        compileStep={compileStep}
         onOpenAuth={() => setIsAuthOpen(true)}
         onLogout={handleLogout}
         isLoggedIn={isLoggedIn}
-        onHome={() => setCurrentView('home')}
+        onHome={handleGoHome}
         projectName={currentProject?.name || 'Local Project'}
         selectedCompiler={selectedCompiler}
         compilerOptions={compilerOptions}
@@ -1109,10 +1642,16 @@ ${result.log}`);
             >
               <LaTeXEditor
                 fileName={activeFile?.name || 'untitled.tex'}
+                // Namespaced by project and percent-encoded: two projects each
+                // holding a main.tex would otherwise share one Monaco model and
+                // one undo stack, and a '#' or '?' in a name would parse as a
+                // URI fragment and collide with another file.
+                modelPath={`inmemory://zabbleaf/${projectId}/${encodeURIComponent(activeFile?.name || 'untitled.tex')}`}
                 content={activeFile?.content || ''}
                 onChange={handleContentChange}
                 citations={citations}
                 labels={labels}
+                sources={completionSources}
                 revealLine={revealLine}
                 insertion={insertion}
                 onPasteImage={handlePasteImage}
@@ -1134,9 +1673,14 @@ ${result.log}`);
             <div className="split-pane" style={{ flex: '1 1 auto' }}>
               <PDFPreview
                 compiledUrl={compiledPdfUrl}
+                pdfData={compiledPdfData}
                 compileLog={compileLog}
                 isCompiling={isCompiling}
                 isPdf={compiledIsPdf}
+                compileStep={compileStep}
+                // PDFPreview renders Stop on the mere presence of the callback,
+                // so the engines that cannot be stopped must not be given one.
+                onCancelCompile={canCancelCompile ? handleCancelCompile : undefined}
                 onJumpToError={handleJumpToError}
                 onInstallPackage={handleInstallPackage}
                 installingPackage={installingPackage}

@@ -9,7 +9,10 @@ edition = "2021"
 tauri-build = { version = "1.5", features = [] }
 
 [dependencies]
-tauri = { version = "1.5", features = [ "path-all", "shell-execute", "shell-open", "fs-all", "http-all"] }
+# This list must match, feature for feature, what the tauri.conf.json allowlist
+# asks for: tauri-build cross-checks the two and fails the build on a mismatch.
+# "window-close" pairs with "window": { "close": true } there.
+tauri = { version = "1.5", features = [ "path-all", "shell-execute", "shell-open", "fs-all", "http-all", "window-close"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"

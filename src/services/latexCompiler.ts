@@ -17,6 +17,19 @@ export class LaTeXCompilerService {
   private previousPdfUrl: string | null = null;
 
   /**
+   * Releases this service's preview URL. The two compiler services each hold
+   * their own single-slot blob URL, so switching the dropdown to a real engine
+   * or opening another project stranded the last HTML preview in memory until
+   * this service happened to compile again.
+   */
+  reset(): void {
+    if (this.previousPdfUrl) {
+      URL.revokeObjectURL(this.previousPdfUrl);
+    }
+    this.previousPdfUrl = null;
+  }
+
+  /**
    * Compiles LaTeX source code to a formatted HTML preview.
    * Parses LaTeX structure (title, sections, abstract, equations) and 
    * renders a typeset document preview in the style of a real PDF.
@@ -183,6 +196,13 @@ export class LaTeXCompilerService {
     return (letter + combining).normalize('NFC');
   }
 
+  /**
+   * Every interpolation below is escaped. This preview is served from a blob:
+   * URL, which runs in the app's own origin, and Quick Preview is the default
+   * engine with auto-compile on — so `\title{<img src=x onerror=...>}` in a
+   * collaborator's project or a downloaded template used to execute its markup
+   * the moment the document was opened, with no user action at all.
+   */
   private generatePdfHtml(doc: ParsedDocument): string {
     let sectionCounter = 0;
     let subSectionCounter = 0;
@@ -193,28 +213,30 @@ export class LaTeXCompilerService {
       if (s.level === 1) { sectionCounter++; subSectionCounter = 0; number = `${sectionCounter}. `; }
       else if (s.level === 2) { subSectionCounter++; number = `${sectionCounter}.${subSectionCounter}. `; }
       
+      // Escaped before the <li>/<p> wrapping, so the wrapping regex below still
+      // matches our own tags and can no longer match a <li> the document wrote.
       const content = s.content
         .split('\n')
         .filter(line => line.trim())
         .map(line => {
-          if (line.trim().startsWith('• ')) return `<li>${line.trim().substring(2)}</li>`;
-          return `<p>${line}</p>`;
+          if (line.trim().startsWith('• ')) return `<li>${escapeHtml(line.trim().substring(2))}</li>`;
+          return `<p>${escapeHtml(line)}</p>`;
         })
         .join('');
-      
+
       // Wrap consecutive <li> items in a <ul>
       const wrappedContent = content.replace(/(<li>.*?<\/li>)+/g, '<ul>$&</ul>');
-      return `<${tag}>${number}${s.title}</${tag}>${wrappedContent}`;
+      return `<${tag}>${number}${escapeHtml(s.title)}</${tag}>${wrappedContent}`;
     }).join('');
 
     const abstractHtml = doc.abstract
       ? `<div class="abstract">
-           <strong>Abstract — </strong>${doc.abstract}
+           <strong>Abstract — </strong>${escapeHtml(doc.abstract)}
          </div>`
       : '';
 
     const equationsHtml = doc.equations.length > 0
-      ? doc.equations.map(eq => `<div class="equation">${eq.trim()}</div>`).join('')
+      ? doc.equations.map(eq => `<div class="equation">${escapeHtml(eq.trim())}</div>`).join('')
       : '';
 
     const bodyHtml = doc.body
@@ -248,9 +270,9 @@ export class LaTeXCompilerService {
   .equation { text-align: center; padding: 12px 20px; margin: 16px 40px; background: #fafafa; border: 1px solid #eee; border-radius: 4px; font-family: 'Cambria Math', 'Computer Modern', serif; font-style: italic; color: #333; }
   .footer { text-align: center; margin-top: 40px; padding-top: 16px; border-top: 1px solid #eee; font-size: 8pt; color: #aaa; }
 </style></head><body>
-<h1>${doc.title}</h1>
-<div class="author">${doc.author}</div>
-<div class="date">${doc.date}</div>
+<h1>${escapeHtml(doc.title)}</h1>
+<div class="author">${escapeHtml(doc.author)}</div>
+<div class="date">${escapeHtml(doc.date)}</div>
 ${abstractHtml}
 ${sectionsHtml}
 ${bodyHtml}

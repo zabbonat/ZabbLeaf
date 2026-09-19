@@ -138,7 +138,21 @@ export function countBySection(content: string): SectionCount[] {
 
   // Line numbers are counted in the whole file, so clicking one can jump there.
   const offset = Math.max(content.indexOf(text), 0);
-  const lineOf = (index: number) => content.slice(0, offset + index).split('\n').length;
+
+  // This used to be content.slice(0, offset + index).split('\n').length, run once
+  // per heading: on a 150 KB chapter with 60 headings that copied and split
+  // several megabytes of string every time the section panel recomputed. The
+  // marks below are in ascending index order and map visits them in order, so a
+  // single newline scan that never goes backwards gives the same answer.
+  let scanned = 0;
+  let line = 1;
+  const lineOf = (index: number) => {
+    const target = offset + index;
+    for (; scanned < target; scanned += 1) {
+      if (content.charCodeAt(scanned) === 10) line += 1;
+    }
+    return line;
+  };
 
   return marks.map((mark, position) => {
     const end = position + 1 < marks.length ? marks[position + 1].index : text.length;
